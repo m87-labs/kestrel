@@ -422,20 +422,29 @@ class Qwen35DFlashDecoder:
         if policy is not None:
             begin, end = self._draft_timing_events
             begin.record()
-        noise = torch.full((count, config.block_size), config.mask_token_id,
-                           device=self.runtime.device, dtype=torch.long)
-        noise[:, 0] = torch.tensor([session.bonus for session in sessions],
-                                   device=self.runtime.device)
-        positions = [torch.arange(session.draft_cache.length,
-                                  session.cache.seq_length + config.block_size,
-                                  device=self.runtime.device)[None]
-                     for session in sessions]
-        with self._draft_tokens(
-                self.text.embed_tokens(noise).split(1), [session.features for session in sessions],
-                positions, [session.draft_cache for session in sessions], noise[:, 0]) as tokens:
-            if policy is not None:
-                end.record()
-            ids = tokens.tolist()
+        if warmed:
+            with graph.launch_tokens_many(
+                    [session.features for session in sessions], self.text.embed_tokens.weight,
+                    bonuses=[session.bonus for session in sessions],
+                    target_positions=[session.cache.seq_length for session in sessions]) as tokens:
+                if policy is not None:
+                    end.record()
+                ids = tokens.tolist()
+        else:
+            noise = torch.full((count, config.block_size), config.mask_token_id,
+                               device=self.runtime.device, dtype=torch.long)
+            noise[:, 0] = torch.tensor([session.bonus for session in sessions],
+                                       device=self.runtime.device)
+            positions = [torch.arange(session.draft_cache.length,
+                                      session.cache.seq_length + config.block_size,
+                                      device=self.runtime.device)[None]
+                         for session in sessions]
+            with self._draft_tokens(
+                    self.text.embed_tokens(noise).split(1), [session.features for session in sessions],
+                    positions, [session.draft_cache for session in sessions], noise[:, 0]) as tokens:
+                if policy is not None:
+                    end.record()
+                ids = tokens.tolist()
         if policy is not None:
             confidence = self._batch_draft_confidence[count].flatten().tolist()
             if warmed:

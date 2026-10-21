@@ -311,6 +311,44 @@ class DFlashDraftGraphSession:
         finally:
             self.active = False
 
+    @contextmanager
+    def launch_tokens_many(self, features, embedding, *, bonuses, target_positions):
+        """Stage independent owners directly into the retained batched graph inputs."""
+        from kestrel_kernels.draft_staging import stage_draft_inputs_many
+        if self.failed or self.closed or self.active:
+            raise RuntimeError("draft graph session is failed or retired")
+        count = len(self.caches)
+        if (self.lm_head is None or len(features) != count or len(bonuses) != count
+                or len(target_positions) != count):
+            raise ValueError("direct draft staging requires complete token-producing owners")
+        lengths = tuple(feature.shape[1] for feature in features)
+        if (self.lengths != tuple(cache.length for cache in self.caches)
+                or any(cache.length + length != position
+                       or cache.length + length + self.query_rows > cache.capacity
+                       for cache, length, position in zip(self.caches, lengths, target_positions))):
+            raise ValueError("draft staging cache ownership or capacity mismatch")
+        consumer = torch.cuda.current_stream(embedding.device)
+        def stage(inputs):
+            stage_draft_inputs_many(features, embedding, inputs, starts=self.lengths,
+                bonuses=bonuses, mask_token=self.model.config.mask_token_id,
+                capacity=self.workspaces[0].capacity)
+            for feature in features:
+                feature.record_stream(self.stream)
+            embedding.record_stream(self.stream)
+        self.active = True
+        try:
+            with self.graph.launch_staged(stage) as (output,):
+                yield output
+                self._commit_context(lengths)
+            if consumer != self.stream:
+                consumer.wait_stream(self.stream)
+                output.record_stream(consumer)
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            self.active = False
+
     def shutdown(self):
         if self.active:
             raise RuntimeError("cannot retire an active draft graph lease")
