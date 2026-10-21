@@ -128,6 +128,28 @@ class DFlashDraftGraphSession:
         self.graph = FixedShapeSinglePassGraph(
             enabled=True, device=parameter.device, stream=self.stream,
             run_forward=self._forward, max_entries=1)
+        self._context_copy_plan = self._bind_context_copy_plan()
+
+    def _bind_context_copy_plan(self):
+        """Retain independent cache destinations while this owner cohort lives."""
+        if len(self.caches) not in (2, 4):
+            return None
+        from kestrel_kernels.draft_context_copy import DraftContextCopyPlan
+        sources, destinations = [], []
+        for index, workspace in enumerate(self.workspaces):
+            sources.extend((workspace.keys, workspace.values))
+            destinations.extend((
+                tuple(cache.layers[index].keys for cache in self.caches),
+                tuple(cache.layers[index].values for cache in self.caches)))
+        tensors = (*sources, *(value for row in destinations for value in row))
+        if any(not value.is_contiguous() for value in tensors):
+            return None
+        ranges = sorted((value.data_ptr(), value.data_ptr() + value.numel() * value.element_size())
+                        for value in tensors)
+        if any(end > following for (_, end), (following, _) in zip(ranges, ranges[1:])):
+            return None
+        return DraftContextCopyPlan(sources, destinations,
+                                    context_rows=self.context_rows, stream=self.stream)
 
     def rebind(self, caches):
         """Replace retired owners whose logical capacities fit retained storage."""
@@ -159,6 +181,7 @@ class DFlashDraftGraphSession:
                     layer.values.record_stream(self.stream)
         self.caches = caches
         self.lengths = tuple(cache.length for cache in caches)
+        self._context_copy_plan = self._bind_context_copy_plan()
 
     def _forward(self, hidden, targets, positions, mapping, used, anchors):
         context = self.model.hidden_norm(self.model.fc(targets))
@@ -260,18 +283,21 @@ class DFlashDraftGraphSession:
             self.active = False
 
     def _commit_context(self, lengths):
-        destinations, sources = [], []
-        for index, workspace in enumerate(self.workspaces):
-            for slot, (cache, start, length) in enumerate(zip(self.caches, self.lengths, lengths)):
-                if length:
-                    destinations.extend((cache.layers[index].keys[0, start:start + length],
-                                         cache.layers[index].values[0, start:start + length]))
-                    sources.extend((workspace.keys[slot, start:start + length],
-                                    workspace.values[slot, start:start + length]))
-                    cache.layers[index].keys.record_stream(self.stream)
-                    cache.layers[index].values.record_stream(self.stream)
-        if destinations:
-            torch._foreach_copy_(destinations, sources)
+        if self._context_copy_plan is not None:
+            self._context_copy_plan.run(self.lengths, lengths)
+        else:
+            destinations, sources = [], []
+            for index, workspace in enumerate(self.workspaces):
+                for slot, (cache, start, length) in enumerate(zip(self.caches, self.lengths, lengths)):
+                    if length:
+                        destinations.extend((cache.layers[index].keys[0, start:start + length],
+                                             cache.layers[index].values[0, start:start + length]))
+                        sources.extend((workspace.keys[slot, start:start + length],
+                                        workspace.values[slot, start:start + length]))
+                        cache.layers[index].keys.record_stream(self.stream)
+                        cache.layers[index].values.record_stream(self.stream)
+            if destinations:
+                torch._foreach_copy_(destinations, sources)
         self.lengths = tuple(start + length for start, length in zip(self.lengths, lengths))
         for cache, length in zip(self.caches, self.lengths):
             cache.length = length
@@ -354,6 +380,7 @@ class DFlashDraftGraphSession:
             raise RuntimeError("cannot retire an active draft graph lease")
         self.closed = True
         self.graph.shutdown()
+        self._context_copy_plan = None
         # A caller can still hold this retired session while constructing its
         # replacement. Release synchronized storage now to avoid overlapping
         # two full draft KV workspaces during a batch geometry change.
