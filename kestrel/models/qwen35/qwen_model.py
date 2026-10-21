@@ -930,7 +930,11 @@ class Qwen3_5Experts(nn.Module):
             ),
             device=hidden_states.device,
         )
-        pack_kwargs: dict[str, Any] = {}
+        # Checkpoint loading interleaves gate/up rows for both BF16 and FP8.
+        # Single-token BF16 dispatch validates this tag before warpgemv launch.
+        pack_kwargs: dict[str, Any] = {
+            "weight_scale_layout": _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT,
+        }
         if self.expert_weight_format == "fp8_e4m3":
             pack_kwargs = {
                 "up_scale": self.gate_up_proj_scale,

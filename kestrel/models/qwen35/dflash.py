@@ -150,11 +150,16 @@ class _Attention(nn.Module):
         self.head_dim = config.head_dim
         self.causal, self.window = config.attention(index)
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        self.kv_proj = nn.Linear(config.hidden_size, 2 * config.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         self.q_norm = _Norm(self.head_dim, config.rms_norm_eps)
         self.k_norm = _Norm(self.head_dim, config.rms_norm_eps)
+
+    def k_proj(self, hidden):
+        return torch.nn.functional.linear(hidden, self.kv_proj.weight.chunk(2, dim=0)[0])
+
+    def v_proj(self, hidden):
+        return torch.nn.functional.linear(hidden, self.kv_proj.weight.chunk(2, dim=0)[1])
 
     def forward(self, hidden, context, query_rotary, key_rotary, *, cache=None, past_context=0,
                 cache_capacity=0):
@@ -219,8 +224,11 @@ class _Attention(nn.Module):
             raise ValueError("stable draft attention requires matching CUDA workspace inputs")
         joined = torch.cat((context, hidden), dim=1)
         q = self.q_norm(self.q_proj(hidden).reshape(batch, rows, -1, self.head_dim))
-        k = self.k_norm(self.k_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim))
-        v = self.v_proj(joined).reshape(batch, joined.shape[1], -1, self.head_dim)
+        k, v = self.kv_proj(joined).chunk(2, dim=-1)
+        # The packed KV projection leaves a gap between consecutive key rows.
+        # Materialize them so head normalization can use its native row kernel.
+        k = self.k_norm(k.contiguous().reshape(batch, joined.shape[1], -1, self.head_dim))
+        v = v.reshape(batch, joined.shape[1], -1, self.head_dim)
         q, k = q.transpose(1, 2), k.transpose(1, 2)
         q, _ = get_runtime().rotary.text_mrope_apply(q, q[:, :0], *query_rotary)
         k, _ = get_runtime().rotary.text_mrope_apply(k, k[:, :0], *key_rotary)
@@ -239,12 +247,12 @@ class _Attention(nn.Module):
 class _MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(config.hidden_size, 2 * config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden):
-        return self.down_proj(torch.nn.functional.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+        gate, up = self.gate_up_proj(hidden).chunk(2, dim=-1)
+        return self.down_proj(torch.nn.functional.silu(gate) * up)
 
 
 class _DynamicConv(nn.Module):
@@ -306,8 +314,10 @@ class _Layer(nn.Module):
         if kernels is not None:
             output = torch.cat([self.attention_conv.finish(part, kernel) for part, kernel in
                                 zip(output.split(lengths, dim=1), kernels)], dim=1)
-        hidden = hidden + output
-        normalized = self.post_attention_layernorm(hidden)
+        normalized = get_runtime().dense.add_rmsnorm(
+            output, hidden, self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps)
+        hidden = output
         if self.mlp_conv is None:
             return hidden + self.mlp(normalized)
         prepared = [self.mlp_conv.prepare(part) for part in normalized.split(lengths, dim=1)]
@@ -393,10 +403,12 @@ class DFlashDraftModel(nn.Module):
             if not cache.layers:
                 cache.layers = [_LayerContextBuffer() for _ in self.layers]
         noise = torch.cat(noise_embeddings, dim=1)
-        targets = torch.cat(target_hiddens, dim=1)
-        context = (self.hidden_norm(self.fc(targets)) if targets.shape[1]
-                   else noise.new_empty((1, 0, self.config.hidden_size)))
-        contexts = context.split(context_lengths, dim=1)
+        # Project each owner before packing attention. Concatenating the wide
+        # target taps retained a 558 MiB temporary through every draft layer in
+        # the four-request H100 admission run and exhausted device memory.
+        contexts = tuple(self.hidden_norm(self.fc(target)) if target.shape[1]
+                         else noise.new_empty((1, 0, self.config.hidden_size))
+                         for target in target_hiddens)
         positions = torch.cat(position_ids, dim=1)
         cos, sin = self.rotary_emb(noise, positions[..., None])
         joined_lengths = tuple(context + query for context, query in zip(context_lengths, query_lengths))
@@ -417,10 +429,17 @@ class DFlashDraftModel(nn.Module):
             cache.length += length
         return result
 
-    def select_tokens(self, hidden, lm_head, anchors):
+    def select_tokens(self, hidden, lm_head, anchors, *, confidence=None):
+        # H100 BF16 head probe: padding 15 rows to 16/32/64 measured
+        # 362.5/367.5/376.6 us versus 362.1 us; retain only proposed rows.
         rows = hidden[:, 1:]
         logits = lm_head(rows.reshape(1, -1, rows.shape[-1])).reshape(
             rows.shape[0], rows.shape[1], -1)
+        if confidence is not None:
+            if self.candidate_selector is not None:
+                raise ValueError("confidence requires independent greedy draft proposals")
+            from kestrel_kernels.argmax_confidence import argmax_with_confidence
+            return argmax_with_confidence(logits, confidence)
         if self.candidate_selector is None:
             return logits.argmax(-1).to(torch.int32)
         return self.candidate_selector(rows, logits, anchors).to(torch.int32)
@@ -440,6 +459,17 @@ def load_dflash_drafter(path: str | Path, *, device: torch.device) -> DFlashDraf
             state[key + ".weight"] = state.pop(key)
     if any(value.dtype != torch.bfloat16 for value in state.values()):
         raise ValueError("DFlash draft checkpoint must contain BF16 weights")
+    # Pack independent projections once. Checkpoint values and BF16 arithmetic
+    # are unchanged; a single allocation owns each pair after loading.
+    for index in range(config.num_hidden_layers):
+        for module, first, second, packed in (
+            ("self_attn", "k_proj", "v_proj", "kv_proj"),
+            ("mlp", "gate_proj", "up_proj", "gate_up_proj"),
+        ):
+            prefix = f"layers.{index}.{module}."
+            state[prefix + packed + ".weight"] = torch.cat((
+                state.pop(prefix + first + ".weight"),
+                state.pop(prefix + second + ".weight")), dim=0)
     model.load_state_dict(state, strict=True, assign=True)
     model.rotary_emb.inv_freq = default_inv_freq(config.head_dim, config.rope_theta, device=device)
     return model.requires_grad_(False).eval()

@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from contextlib import ExitStack, contextmanager
 from collections import Counter
 from typing import Any
+import time
 
 import torch
 
@@ -59,6 +60,13 @@ class Qwen35DFlashDecoder:
         self._commit_ready = torch.cuda.Event()
         self._commit_pending = False
         self._generated_verification = None
+        self._width_policy = None
+        self._draft_confidence = None
+        self._batch_width_policies = {}
+        self._batch_span_verifiers = {}
+        self._batch_draft_confidence = {}
+        self._draft_timing_events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        self._candidate_buffers = {}
         from .generated_verification import Qwen35GeneratedVerification
 
         if (runtime.decode_path == "generated" or
@@ -69,7 +77,34 @@ class Qwen35DFlashDecoder:
             for sequences in range(2, runtime.max_batch_size + 1):
                 self._generated_verifiers[sequences] = Qwen35GeneratedVerification(
                     runtime, self.draft, sequences=sequences,
-                    weights=self._generated_verification.weights)
+                    weights=self._generated_verification.weights,
+                    **({"verification_rows": {2: 8, 3: 2, 4: 4}[sequences]}
+                       if self._generated_verification.segmented else {}))
+        if (self._generated_verification is not None
+                and self._generated_verification.segmented and self._draft_graph_enabled
+                and self.draft.candidate_selector is None):
+            from .verification_policy import VerificationWidthPolicy
+            self._width_policy = VerificationWidthPolicy()
+            self._span_verifiers = {config.block_size: self._generated_verification}
+            for width in self._width_policy.widths:
+                if width not in self._span_verifiers:
+                    self._span_verifiers[width] = Qwen35GeneratedVerification(
+                        runtime, self.draft, weights=self._generated_verification.weights,
+                        verification_rows=width)
+            self._draft_confidence = torch.empty((1, config.block_size-1),
+                                                dtype=torch.float32, device=runtime.device)
+            for sequences, widths in ((2, (2, 4, 8)), (4, (2, 4))):
+                if sequences > runtime.max_batch_size:
+                    continue
+                self._batch_width_policies[sequences] = VerificationWidthPolicy(widths)
+                verifiers = {widths[-1]: self._generated_verifiers[sequences]}
+                for width in widths[:-1]:
+                    verifiers[width] = Qwen35GeneratedVerification(
+                        runtime, self.draft, sequences=sequences,
+                        weights=self._generated_verification.weights, verification_rows=width)
+                self._batch_span_verifiers[sequences] = verifiers
+                self._batch_draft_confidence[sequences] = torch.empty(
+                    (sequences, config.block_size - 1), dtype=torch.float32, device=runtime.device)
         if runtime._cfg.enable_cuda_graphs and self._generated_verification is None:
             from .spec_target_graph import Qwen35TargetGraph
             from .spec_replay_graph import Qwen35ReplayGraph
@@ -78,12 +113,15 @@ class Qwen35DFlashDecoder:
             self._replay_graph = Qwen35ReplayGraph(runtime, config.block_size,
                 target.num_hidden_layers)
 
-    def _verify(self, leases, *, state_sources=None, **kwargs):
+    def _verify(self, leases, *, state_sources=None, last_token_only=False, **kwargs):
         if leases is None or self._target_graph is None:
             if state_sources is not None:
                 raise RuntimeError("unmaterialized recurrent rows require a verification graph")
             output = self.text(**kwargs)
-            return output, self.runtime.model.lm_head(output.last_hidden_state).argmax(-1)
+            hidden = output.last_hidden_state
+            if last_token_only:
+                hidden = hidden[:, -1:]
+            return output, self.runtime.model.lm_head(hidden).argmax(-1)
         return leases.enter_context(self._target_graph.launch(state_sources=state_sources, **kwargs))
 
     def shutdown(self):
@@ -129,6 +167,10 @@ class Qwen35DFlashDecoder:
             raise ValueError("speculative sequence is already admitted")
         if not self.free_slots:
             raise RuntimeError("Qwen DFlash sequence slot is occupied")
+        if not self._sessions and self._width_policy is not None:
+            self._width_policy.reset_request()
+            for policy in self._batch_width_policies.values():
+                policy.reset_request()
         tokens = [int(token.token_id) for token in prompt_tokens]
         if any(token < 0 or token >= self.runtime.vocab_size for token in tokens):
             raise ValueError("prompt token is outside the target vocabulary")
@@ -248,7 +290,20 @@ class Qwen35DFlashDecoder:
     def _target(self, tokens, committed, slot, *, capture, leases=None):
         self._wait_for_commit()
         if capture and self._generated_verification is not None:
-            self._generated_verification = self._generated_verifiers[1]
+            if self._width_policy is not None:
+                if not self._width_policy.calibrated:
+                    if len(tokens) != self.draft.config.block_size:
+                        raise ValueError("verification calibration requires the full draft proposal")
+                    samples = {width: [] for width in self._width_policy.widths}
+                    for repeat in range(5):
+                        order = self._width_policy.widths[::1 if repeat % 2 == 0 else -1]
+                        for width in order:
+                            samples[width].append(self._span_verifiers[width].measure_replay(
+                                tokens[:width].unsqueeze(0), [committed], [slot]))
+                    self._width_policy.set_target_samples(samples)
+                self._generated_verification = self._span_verifiers[len(tokens)]
+            else:
+                self._generated_verification = self._generated_verifiers[1]
             return self._generated_verification.target(tokens, committed, slot)
         cache = committed.fork_recurrent_state(capture_prefix=capture)
         device = self.runtime.device
@@ -260,7 +315,7 @@ class Qwen35DFlashDecoder:
         slots = page_row[0, positions // page_size].long() * page_size + positions % page_size
         cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
             sequence_lengths=(length,), device=device)
-        output, predictions = self._verify(leases,
+        output, predictions = self._verify(leases, last_token_only=not capture,
             input_ids=ids, past_key_values=cache, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slots, page_table=page_row,
             paged_kv_seqlens_k=torch.tensor([start+length], device=device, dtype=torch.int32),
@@ -275,6 +330,8 @@ class Qwen35DFlashDecoder:
 
     @contextmanager
     def _draft_tokens(self, noise, features, positions, caches, anchors=None):
+        confidence = (getattr(self, "_draft_confidence", None) if len(caches) == 1 else
+                      getattr(self, "_batch_draft_confidence", {}).get(len(caches)))
         eligible = (self._draft_graph_enabled
                     and all(cache.layers for cache in caches)
                     and all(value.shape[1] <= self.draft.config.block_size for value in features))
@@ -284,16 +341,22 @@ class Qwen35DFlashDecoder:
             else:
                 hidden = torch.cat(self.draft.forward_many(
                     noise, features, positions, context_caches=caches), dim=0)
-            yield self.draft.select_tokens(hidden, self.runtime.model.lm_head, anchors)
+            if confidence is None:
+                yield self.draft.select_tokens(hidden, self.runtime.model.lm_head, anchors)
+            else:
+                yield self.draft.select_tokens(hidden, self.runtime.model.lm_head, anchors,
+                                                confidence=confidence)
             return
         from .draft_workspace import DFlashDraftGraphSession
         if (self._draft_graph is None or len(self._draft_graph.caches) != len(caches)
-                or tuple(cache.capacity for cache in self._draft_graph.caches)
-                != tuple(cache.capacity for cache in caches)):
+                or any(cache.capacity > self._draft_graph.workspaces[0].capacity
+                       for cache in caches)):
             if self._draft_graph is not None:
                 self._draft_graph.shutdown()
+                self._draft_graph = None
             self._draft_graph = DFlashDraftGraphSession(
-                self.draft, caches, lm_head=self.runtime.model.lm_head)
+                self.draft, caches, lm_head=self.runtime.model.lm_head,
+                confidence=confidence)
         elif (any(left is not right for left, right in zip(self._draft_graph.caches, caches))
               or self._draft_graph.lengths != tuple(cache.length for cache in caches)):
             self._draft_graph.rebind(caches)
@@ -301,8 +364,37 @@ class Qwen35DFlashDecoder:
             yield tokens
 
     def propose(self, ctx):
+        if self._width_policy is None:
+            return self._propose_fixed(ctx)
+        warmed = (self._draft_graph is not None and len(self._draft_graph.caches) == 1
+                  and bool(ctx.draft_cache.layers)
+                  and ctx.draft_cache.capacity <= self._draft_graph.workspaces[0].capacity
+                  and self._draft_graph.graph.has_staged_entry)
+        self._last_draft_warm = warmed
+        begin, end = self._draft_timing_events
+        begin.record()
+        result = self._propose_fixed(ctx)
+        end.record()
+        probabilities = self._draft_confidence[0].tolist()
+        # This blocking D2H copy follows the timing event on the current stream.
+        if warmed:
+            self._width_policy.record_draft(begin.elapsed_time(end))
+        width = self._width_policy.choose(probabilities)
+        return DraftResult(token_ids=result.token_ids[:, :width-1])
+
+    def _propose_fixed(self, ctx):
         config = self.draft.config
         start = ctx.cache.seq_length
+        session = self._draft_graph
+        if (session is not None and len(session.caches) == 1
+                and session.caches[0] is ctx.draft_cache
+                and session.lengths == (ctx.draft_cache.length,)
+                and ctx.features.shape[1] <= session.context_rows
+                and session.graph.has_staged_entry):
+            with session.launch_tokens(ctx.features, self.text.embed_tokens.weight,
+                                       bonus=ctx.bonus, target_position=start) as ids:
+                pass
+            return DraftResult(token_ids=ids)
         noise = torch.full((1, config.block_size), config.mask_token_id,
                            device=self.runtime.device, dtype=torch.long)
         noise[0, 0] = ctx.bonus
@@ -318,27 +410,74 @@ class Qwen35DFlashDecoder:
 
     def _propose_many(self, sessions):
         config = self.draft.config
-        noise = torch.full((len(sessions), config.block_size), config.mask_token_id,
-                           device=self.runtime.device, dtype=torch.long)
-        noise[:, 0] = torch.tensor([session.bonus for session in sessions],
-                                   device=self.runtime.device)
-        positions = [torch.arange(session.draft_cache.length,
-                                  session.cache.seq_length + config.block_size,
-                                  device=self.runtime.device)[None]
-                     for session in sessions]
-        with self._draft_tokens(
-                self.text.embed_tokens(noise).split(1), [session.features for session in sessions],
-                positions, [session.draft_cache for session in sessions], noise[:, 0]) as tokens:
-            ids = tokens.tolist()
-        return [[session.bonus, *row] for session, row in zip(sessions, ids)]
+        count = len(sessions)
+        policy = getattr(self, "_batch_width_policies", {}).get(count)
+        graph = self._draft_graph
+        warmed = (graph is not None and len(graph.caches) == count
+                  and graph.graph.has_staged_entry
+                  and all(left is right.draft_cache for left, right in zip(graph.caches, sessions))
+                  and graph.lengths == tuple(session.draft_cache.length for session in sessions)
+                  and all(session.features.shape[1] <= config.block_size for session in sessions))
+        self._last_draft_warm = warmed
+        if policy is not None:
+            begin, end = self._draft_timing_events
+            begin.record()
+        if warmed:
+            with graph.launch_tokens_many(
+                    [session.features for session in sessions], self.text.embed_tokens.weight,
+                    bonuses=[session.bonus for session in sessions],
+                    target_positions=[session.cache.seq_length for session in sessions]) as tokens:
+                if policy is not None:
+                    end.record()
+                ids = tokens.tolist()
+        else:
+            noise = torch.full((count, config.block_size), config.mask_token_id,
+                               device=self.runtime.device, dtype=torch.long)
+            noise[:, 0] = torch.tensor([session.bonus for session in sessions],
+                                       device=self.runtime.device)
+            positions = [torch.arange(session.draft_cache.length,
+                                      session.cache.seq_length + config.block_size,
+                                      device=self.runtime.device)[None]
+                         for session in sessions]
+            with self._draft_tokens(
+                    self.text.embed_tokens(noise).split(1), [session.features for session in sessions],
+                    positions, [session.draft_cache for session in sessions], noise[:, 0]) as tokens:
+                if policy is not None:
+                    end.record()
+                ids = tokens.tolist()
+        if policy is not None:
+            confidence = self._batch_draft_confidence[count].flatten().tolist()
+            if warmed:
+                policy.record_draft(begin.elapsed_time(end))
+            width = policy.choose(confidence, sequences=count)
+        else:
+            width = (self._generated_verifiers[count].block
+                     if self._generated_verification is not None else config.block_size)
+        return [[session.bonus, *row[:width - 1]] for session, row in zip(sessions, ids)]
 
     def _target_many(self, candidates, sessions, *, leases=None):
         if self._generated_verification is not None:
             self._wait_for_commit()
-            self._generated_verification = self._generated_verifiers[len(sessions)]
-            return self._generated_verification.target_many(candidates,
-                [session.cache for session in sessions],
-                [session.state.batch_idx for session in sessions])
+            count = len(sessions)
+            committed = [session.cache for session in sessions]
+            slots = [session.state.batch_idx for session in sessions]
+            policy = getattr(self, "_batch_width_policies", {}).get(count)
+            if policy is not None:
+                verifiers = self._batch_span_verifiers[count]
+                if not policy.calibrated:
+                    if any(len(row) != policy.widths[-1] for row in candidates):
+                        raise ValueError("batched calibration requires complete maximum-span proposals")
+                    tokens = torch.tensor(candidates, device=self.runtime.device, dtype=torch.long)
+                    samples = {width: [] for width in policy.widths}
+                    for repeat in range(5):
+                        for width in policy.widths[::1 if repeat % 2 == 0 else -1]:
+                            samples[width].append(verifiers[width].measure_replay(
+                                tokens[:, :width], committed, slots))
+                    policy.set_target_samples(samples)
+                self._generated_verification = verifiers[len(candidates[0])]
+            else:
+                self._generated_verification = self._generated_verifiers[count]
+            return self._generated_verification.target_many(candidates, committed, slots)
         """Verify independent sequences together, retaining separate commit owners."""
         self._wait_for_commit()
         device = self.runtime.device
@@ -420,9 +559,18 @@ class Qwen35DFlashDecoder:
     def step(self, states, *, allowed_token_ids=None, suppressed_token_ids=None, commit_caps=None):
         if self._closed or self._graph_failed:
             raise RuntimeError('speculative decoder is shut down or its verification graph failed')
+        policy = (self._width_policy if len(states) == 1 else
+                  getattr(self, "_batch_width_policies", {}).get(len(states)))
+        measured = policy is not None and policy.calibrated
+        self._last_draft_warm = False
+        started = time.perf_counter()
         with ExitStack() as leases:
-            return self._step(states, allowed_token_ids=allowed_token_ids,
+            result = self._step(states, allowed_token_ids=allowed_token_ids,
                 suppressed_token_ids=suppressed_token_ids, commit_caps=commit_caps, leases=leases)
+        if measured and self._last_draft_warm:
+            policy.record_cycle(self._generated_verification.block,
+                                           (time.perf_counter()-started)*1000)
+        return result
 
     def _step(self, states, *, allowed_token_ids, suppressed_token_ids, commit_caps, leases):
         if not states:
@@ -450,8 +598,25 @@ class Qwen35DFlashDecoder:
         try:
             if len(sessions) == 1:
                 session = sessions[0][0]
-                candidates = [[session.bonus, *self.propose(session).token_ids[0].tolist()]]
-                results = [self._target(candidates[0], session.cache, session.state.batch_idx, capture=True, leases=leases)]
+                proposed = self.propose(session).token_ids[0]
+                if self._generated_verification is not None:
+                    # Keep the draft on device until verification completes;
+                    # acceptance needs host tokens, but verification does not.
+                    from kestrel_kernels.verification_pointwise_cuda import stage_candidate
+                    width = proposed.numel() + 1
+                    candidate = self._candidate_buffers.get(width)
+                    if candidate is None:
+                        candidate = torch.empty(width, dtype=proposed.dtype, device=proposed.device)
+                        self._candidate_buffers[width] = candidate
+                    stage_candidate[(1,)](proposed, candidate, session.bonus, width,
+                                          max(32, 1 << (width - 1).bit_length()))
+                    results = [self._target(candidate, session.cache,
+                        session.state.batch_idx, capture=True, leases=leases)]
+                    candidates = [candidate.tolist()]
+                else:
+                    candidates = [[session.bonus, *proposed.tolist()]]
+                    results = [self._target(candidates[0], session.cache,
+                        session.state.batch_idx, capture=True, leases=leases)]
             else:
                 candidates = self._propose_many([session for session, _ in sessions])
                 results = self._target_many(candidates, [session for session, _ in sessions], leases=leases)

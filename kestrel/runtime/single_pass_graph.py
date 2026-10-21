@@ -70,7 +70,11 @@ class _GraphEntry:
     def close(self):
         try:
             self.graph.reset()
-        finally:
+        except BaseException:
+            # Failed retirement cannot establish that this stream is reusable.
+            self.capture.close(reuse=False)
+            raise
+        else:
             self.capture.close()
 
 
@@ -161,8 +165,9 @@ class FixedShapeSinglePassGraph:
         if self._key(static_inputs) != self._key(inputs):
             raise ValueError("graph input allocator changed input layout")
         copies = _GraphInputCopies(static_inputs)
-        # Graph destruction may clear cuBLAS workspaces for its capture stream.
-        # Pooled streams can alias another live graph after the pool wraps.
+        # Lease a capture stream exclusively until this graph is reset. The
+        # general Torch pool can alias live graphs after wrapping; our pool
+        # reuses only retired streams, bounding cached cuBLAS workspaces.
         capture = OwnedCudaStream(self.device)
         graph = None
         try:
@@ -188,7 +193,10 @@ class FixedShapeSinglePassGraph:
             try:
                 if graph is not None:
                     graph.reset()
-            finally:
+            except BaseException:
+                capture.close(reuse=False)
+                raise
+            else:
                 capture.close()
             raise
 
@@ -251,6 +259,34 @@ class FixedShapeSinglePassGraph:
                             entry.copies.copy(values)
                             entry.graph.replay()
                         yield entry.outputs
+            finally:
+                self._active_lease_thread = None
+
+    @property
+    def has_staged_entry(self) -> bool:
+        """Whether exactly one captured shape is available for direct staging."""
+        with self._lock:
+            return self.enabled and not self._closed and len(self._entries) == 1
+
+    @contextmanager
+    def launch_staged(self, stage: Callable[[tuple[Tensor, ...]], None]):
+        """Lease the sole captured shape after filling its retained inputs.
+
+        The callback runs on the graph stream while its exclusive lease is held.
+        It must overwrite all input values consumed by the captured operation.
+        """
+        with self._lock:
+            if not self.has_staged_entry:
+                raise RuntimeError("direct staging requires one live captured shape")
+            if self._active_lease_thread == threading.get_ident():
+                raise RuntimeError("single-pass graph leases cannot be nested")
+            self._active_lease_thread = threading.get_ident()
+            try:
+                with self._ordered_stream():
+                    entry = next(iter(self._entries.values()))
+                    stage(entry.inputs)
+                    entry.graph.replay()
+                    yield entry.outputs
             finally:
                 self._active_lease_thread = None
 
