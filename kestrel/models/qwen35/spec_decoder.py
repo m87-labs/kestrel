@@ -78,7 +78,7 @@ class Qwen35DFlashDecoder:
                 self._generated_verifiers[sequences] = Qwen35GeneratedVerification(
                     runtime, self.draft, sequences=sequences,
                     weights=self._generated_verification.weights,
-                    **({"verification_rows": {2: 8, 3: 2, 4: 4}[sequences]}
+                    **({"verification_rows": {2: 8, 3: 2, 4: 4}.get(sequences, 2)}
                        if self._generated_verification.segmented else {}))
         if (self._generated_verification is not None
                 and self._generated_verification.segmented and self._draft_graph_enabled

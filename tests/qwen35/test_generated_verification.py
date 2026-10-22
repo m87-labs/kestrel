@@ -92,8 +92,8 @@ def test_dflash_auto_does_not_hide_generated_binding_errors(monkeypatch):
 
 
 def test_generated_verification_rejects_unqualified_concurrency():
-    with pytest.raises(ValueError, match="up to four sequences"):
-        Qwen35GeneratedVerification(SimpleNamespace(max_batch_size=5), None)
+    with pytest.raises(ValueError, match="up to eight sequences"):
+        Qwen35GeneratedVerification(SimpleNamespace(max_batch_size=9), None)
 
 
 @pytest.mark.parametrize("count", [0, 17, True, -1])
@@ -268,12 +268,8 @@ def test_generated_verification_long_reasoning_does_not_repeat_zeros():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('verification_rows', (4, 6, 8, 16))
-@pytest.mark.parametrize('mutation', ['none', 'taps', 'capacity', 'experts', 'order', 'page'])
-def test_hopper_verification_rejects_wrong_contract_before_materializing(monkeypatch, mutation, verification_rows):
-    from kestrel.models.qwen35 import generated_verification as module
-
-    runtime, draft = _verification_runtime(weight_format='bf16'), _verification_draft()
+def _hopper_verification_runtime(capacity=1):
+    runtime, draft = _verification_runtime(capacity=capacity, weight_format='bf16'), _verification_draft()
     target = runtime.model.model.language_model.config
     target.__dict__.update(
         hidden_size=2048, num_hidden_layers=40, num_attention_heads=16,
@@ -285,8 +281,18 @@ def test_hopper_verification_rejects_wrong_contract_before_materializing(monkeyp
         tie_word_embeddings=False, mrope_section=(11, 11, 10),
         layer_types=('linear_attention', 'linear_attention', 'linear_attention', 'full_attention') * 10)
     draft.config.target_layer_ids = (1, 6, 11, 16, 22, 27, 32, 37)
+    return runtime, draft
+
+
+@pytest.mark.parametrize('verification_rows', (4, 6, 8, 16))
+@pytest.mark.parametrize('mutation', ['none', 'taps', 'capacity', 'experts', 'order', 'page'])
+def test_hopper_verification_rejects_wrong_contract_before_materializing(monkeypatch, mutation, verification_rows):
+    from kestrel.models.qwen35 import generated_verification as module
+
+    runtime, draft = _hopper_verification_runtime()
+    target = runtime.model.model.language_model.config
     if mutation == 'taps': draft.config.target_layer_ids = (0, 1)
-    elif mutation == 'capacity': runtime.max_batch_size = 5
+    elif mutation == 'capacity': runtime.max_batch_size = 9
     elif mutation == 'experts': target.num_experts = 128
     elif mutation == 'order': target.layer_types = tuple(reversed(target.layer_types))
     elif mutation == 'page': runtime.page_size = 64
@@ -348,3 +354,29 @@ def test_automatic_loading_does_not_allocate_for_unqualified_target(tmp_path, mo
     prepare, finalize = module.verification_weight_loading_callbacks(runtime)
     with pytest.raises(ValueError, match='unsupported Hopper'):
         prepare(runtime.model)
+
+
+@pytest.mark.parametrize('sequences', [5, 6, 7, 8])
+@pytest.mark.parametrize('width', [2, 4])
+def test_hopper_extended_capacity_requires_exact_packaged_span(monkeypatch, sequences, width):
+    from kestrel.models.qwen35 import generated_verification as module
+    runtime, draft = _hopper_verification_runtime(8)
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device: (9, 0))
+    monkeypatch.setattr(torch.cuda, 'get_device_properties',
+                        lambda device: SimpleNamespace(multi_processor_count=132))
+    seen = []
+    monkeypatch.setattr(module, 'resolve_program', lambda **kwargs: seen.append(kwargs))
+    if width == 2:
+        with pytest.raises(RuntimeError, match='missing AOT'):
+            Qwen35GeneratedVerification(runtime, draft, sequences=sequences,
+                                         verification_rows=width)
+        assert seen[0]['program'].endswith(f'_c{sequences}_t2')
+    else:
+        with pytest.raises(ValueError, match='unsupported concurrent'):
+            Qwen35GeneratedVerification(runtime, draft, sequences=sequences,
+                                         verification_rows=width)
+        assert not seen
+    # The opt-in compiled path still requires numerical qualification before
+    # automatic admission is expanded beyond the existing supported contract.
+    runtime._cfg.enable_cuda_graphs = True
+    assert not Qwen35GeneratedVerification.supports(runtime, draft)
