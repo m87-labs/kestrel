@@ -79,7 +79,7 @@ class DFlashDraftGraphSession:
     A failed launch/consumer poisons the session rather than attempting rollback.
     """
 
-    def __init__(self, model, caches, *, lm_head=None, confidence=None):
+    def __init__(self, model, caches, *, lm_head=None, confidence=None, proposal_count=None):
         from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
         self.model = model
@@ -93,6 +93,12 @@ class DFlashDraftGraphSession:
         self.closed = False
         self.active = False
         config = model.config
+        if proposal_count is not None and (type(proposal_count) is not int
+                or not 1 <= proposal_count < config.block_size):
+            raise ValueError("proposal count must fit the draft block")
+        self.proposal_count = config.block_size - 1 if proposal_count is None else proposal_count
+        if confidence is not None and confidence.shape[-1] != self.proposal_count:
+            raise ValueError("draft confidence must match the projected proposal count")
         self.context_rows = config.block_size
         self.query_rows = config.block_size
         parameter = next(model.parameters())
@@ -209,6 +215,8 @@ class DFlashDraftGraphSession:
             hidden = self.model.norm(hidden)
         if self.lm_head is None:
             return (hidden,)
+        # Keep the complete draft transformer; project only consumed proposals.
+        hidden = hidden[:, :self.proposal_count + 1]
         if self.confidence is not None:
             return (self.model.select_tokens(hidden, self.lm_head, anchors,
                                              confidence=self.confidence),)
