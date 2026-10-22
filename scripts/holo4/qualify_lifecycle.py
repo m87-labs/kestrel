@@ -130,6 +130,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--rounds', type=int, default=25)
     parser.add_argument('--kv-cache-pages', type=int)
-    parser.add_argument('--batch-capacity', type=int, choices=(1, 2, 3, 4), default=1)
+    parser.add_argument('--batch-capacity', type=int, choices=range(1, 9), default=1)
     parser.add_argument('--decode-path', choices=('auto', 'generated'), default='auto')
     asyncio.run(asyncio.wait_for(run(parser.parse_args()), timeout=1800))
