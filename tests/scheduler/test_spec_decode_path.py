@@ -386,6 +386,57 @@ def test_spec_finish_on_eos_within_run_retires_and_completes() -> None:
     assert completed[0].finish_reason == "stop"
 
 
+@pytest.mark.parametrize("eos", [999, 1000])
+def test_spec_ignore_eos_is_request_local_and_preserves_token_budget(eos):
+    dec = _FakeDecoder(
+        n_rows=2, first_tokens={0: 11, 1: 11},
+        plans={0: [[12, eos, 13]], 1: [[12, eos, 13]]},
+    )
+    rt = _spec_runtime(dec, eos_id=999)
+    rt.additional_eos_token_ids = (1000,)
+    sched = _make_scheduler(rt)
+    continued = _enqueue(sched, 0, prompt_len=3, max_new=4)
+    normal = _enqueue(sched, 1, prompt_len=3, max_new=4)
+    continued.ignore_eos = True
+    sched._spec_admit()
+    while sched._spec_decode_step():
+        pass
+    assert [t.token_id for t in continued.lifecycle.skill_state.tokens] == [11, 12, eos, 13]
+    assert [t.token_id for t in normal.lifecycle.skill_state.tokens] == [11, 12, eos]
+    assert {c.request_id: c.finish_reason for c in sched.pop_completed()} == {
+        0: "length", 1: "stop"}
+    assert sorted(dec.retired) == [0, 1]
+
+
+@pytest.mark.parametrize("budget", [1, 3])
+def test_spec_ignore_eos_at_admission_still_finishes_at_budget(budget):
+    dec = _FakeDecoder(n_rows=1, first_tokens={0: 999}, plans={0: [[12, 13]]})
+    sched = _make_scheduler(_spec_runtime(dec, eos_id=999))
+    request = _enqueue(sched, 0, prompt_len=3, max_new=budget)
+    request.ignore_eos = True
+    sched._spec_admit()
+    while sched._spec_decode_step():
+        pass
+    assert [t.token_id for t in request.lifecycle.skill_state.tokens] == [999, 12, 13][:budget]
+    assert sched.pop_completed()[0].finish_reason == "length"
+    assert dec.retired == [0]
+
+
+def test_spec_ignore_eos_preserves_distinct_skill_stop(monkeypatch):
+    dec = _FakeDecoder(
+        n_rows=1, first_tokens={0: 11}, plans={0: [[999, 888, 13]]},
+    )
+    sched = _make_scheduler(_spec_runtime(dec, eos_id=999))
+    request = _enqueue(sched, 0, prompt_len=3, max_new=5)
+    request.ignore_eos = True
+    monkeypatch.setattr(request.lifecycle.skill_state, "stop_token_ids", lambda _: (888,))
+    sched._spec_admit()
+    while sched._spec_decode_step():
+        pass
+    assert [t.token_id for t in request.lifecycle.skill_state.tokens] == [11, 999, 888]
+    assert sched.pop_completed()[0].finish_reason == "stop"
+
+
 def test_spec_finish_on_additional_runtime_eos_id() -> None:
     dec = _FakeDecoder(
         n_rows=1,

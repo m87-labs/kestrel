@@ -447,6 +447,7 @@ class _AutoregressiveRequest:
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
+    ignore_eos: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
