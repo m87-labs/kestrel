@@ -3332,8 +3332,9 @@ class GenerationScheduler:
     def _mark_finished_if_needed(self, seq: RequestLifecycle) -> bool:
         last_token = seq.last_token
         is_text = isinstance(last_token, TextToken)
-        eos_hit = is_text and last_token.token_id in self._eos_token_ids
-        if is_text and not eos_hit:
+        is_eos = is_text and last_token.token_id in self._eos_token_ids
+        eos_hit = is_eos and not seq.request.ignore_eos
+        if is_text and not is_eos:
             # A skill (e.g. chat) may terminate a turn on its own token — a
             # ChatML-style ``<|im_end|>`` can differ from the model's ``eos_id``.
             stop_ids = seq.skill_state.stop_token_ids(self.runtime)

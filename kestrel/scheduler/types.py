@@ -278,11 +278,15 @@ class GenerationRequest:
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
+    # Keep EOS in generated tokens, but finish only at another stop or length limit.
+    ignore_eos: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     prompt_length: int = field(init=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.ignore_eos, bool):
+            raise TypeError("ignore_eos must be a boolean")
         self.has_encoder_input = self.encoder_input is not None
         tokens = list(self.prompt_tokens)
         self.prompt_tokens = tokens

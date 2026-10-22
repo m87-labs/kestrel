@@ -255,6 +255,11 @@ result = await engine.query(
 print(result.output["answer"])
 ```
 
+For fixed-length benchmarks, pass `"ignore_eos": True` in `settings`
+(or `ignore_eos=True` to `submit` / `submit_streaming`). This keeps generated
+EOS tokens without ending the request. Token and context limits and distinct
+skill stop tokens still apply. Normal EOS stopping remains the default.
+
 ### Caption
 
 Generate image descriptions:

@@ -550,6 +550,9 @@ class InferenceEngine:
         built = self._skill_registry().resolve(skill_name).build_request(
             image, prompt, settings
         )
+        ignore_eos = settings.get("ignore_eos", False) if settings else False
+        if not isinstance(ignore_eos, bool):
+            raise TypeError("settings.ignore_eos must be a boolean")
         adapter = self._extract_adapter_id(settings)
         return_logprobs = self._extract_logprobs(settings)
         if built.capture_logprobs:
@@ -562,6 +565,7 @@ class InferenceEngine:
         submit_fn = self.submit_streaming if stream else self.submit
         submission = submit_fn(
             built.request_context,
+            ignore_eos=ignore_eos,
             max_new_tokens=built.max_new_tokens,
             adapter=adapter,
             image=effective_image,
@@ -592,6 +596,7 @@ class InferenceEngine:
         _logprobs: Optional[bool] = None,
         _generated_prefix: Optional[object] = None,
         _suppress_next_token_ids: Optional[Sequence[int]] = None,
+        ignore_eos: bool = False,
     ) -> EngineResult:
         cancel_event = threading.Event()
         generated_prefix = self._normalize_generated_prefix(
@@ -611,6 +616,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             return_logprobs=_logprobs,
+            ignore_eos=ignore_eos,
             generated_prefix=generated_prefix,
             suppress_next_token_ids=suppress_next_token_ids,
             stream_queue=None,
@@ -814,6 +820,7 @@ class InferenceEngine:
         _logprobs: Optional[bool] = None,
         _generated_prefix: Optional[object] = None,
         _suppress_next_token_ids: Optional[Sequence[int]] = None,
+        ignore_eos: bool = False,
     ) -> EngineStream:
         queue: _StreamQueue = asyncio.Queue()
         cancel_event = threading.Event()
@@ -834,6 +841,7 @@ class InferenceEngine:
             temperature=temperature,
             top_p=top_p,
             return_logprobs=_logprobs,
+            ignore_eos=ignore_eos,
             generated_prefix=generated_prefix,
             suppress_next_token_ids=suppress_next_token_ids,
             stream_queue=queue,
@@ -1111,9 +1119,12 @@ class InferenceEngine:
         stream_queue: Optional[_StreamQueue],
         skill: str,
         cancel_event: threading.Event | None = None,
+        ignore_eos: bool = False,
     ) -> Tuple[asyncio.Future[EngineResult], int]:
         if self._shutdown:
             raise RuntimeError("InferenceEngine is shut down")
+        if not isinstance(ignore_eos, bool):
+            raise TypeError("ignore_eos must be a boolean")
         await self._ensure_started()
 
         loop = asyncio.get_running_loop()
@@ -1180,6 +1191,7 @@ class InferenceEngine:
             encoder_input=encoder_input,
             max_new_tokens=max_new_tokens,
             temperature=norm_temperature,
+            ignore_eos=ignore_eos,
             top_p=norm_top_p,
             submitted_at=time.perf_counter(),
             future=future,
@@ -1930,6 +1942,7 @@ class InferenceEngine:
             prompt=req.prompt,
             prompt_tokens=prompt_tokens,
             max_new_tokens=req.max_new_tokens,
+            ignore_eos=req.ignore_eos,
             temperature=req.temperature,
             top_p=req.top_p,
             stream_callback=stream_cb,
