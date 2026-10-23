@@ -190,10 +190,17 @@ class RuntimeConfig:
     # Speculative target verification is independent of ordinary token decode.
     # Auto preserves the decode policy; native uses packed prefill kernels.
     verification_path: DecodePath = "auto"
+    # Explicit diagnostic candidate; no automatic cost selection.
+    verification_attention_splits: int | None = None
 
     def __post_init__(self):
         if self.verification_path not in ("auto", "native", "generated"):
             raise ValueError("verification_path must be auto, native, or generated")
+        if self.verification_attention_splits is not None:
+            if (type(self.verification_attention_splits) is not int
+                    or self.verification_attention_splits not in (1, 2, 4, 8)
+                    or self.verification_path != "native"):
+                raise ValueError("verification attention splits require explicit native verification and 1/2/4/8 partitions")
         if self.draft_model_path is not None:
             from kestrel.models import get_spec
 

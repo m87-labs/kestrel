@@ -99,6 +99,7 @@ class Qwen35InferenceCache:
             layers.append(layer)
         self.layers = tuple(layers)
         self.seq_length = 0
+        self.verification_attention_context = None
         self._borrowed_recurrent_state = False
         self._prefix_source: Qwen35InferenceCache | None = None
         self._prefix_start = 0

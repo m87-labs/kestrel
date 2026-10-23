@@ -170,3 +170,15 @@ def test_verification_path_is_independent_of_decode_path():
 def test_verification_path_rejects_unknown_backend():
     with pytest.raises(ValueError, match="verification_path"):
         RuntimeConfig(model_path="/weights", verification_path="triton")
+
+
+@pytest.mark.parametrize("splits", [0, 3, True, "8"])
+def test_verification_attention_rejects_invalid_explicit_splits(splits):
+    with pytest.raises(ValueError, match="verification attention splits"):
+        RuntimeConfig(model_path="/weights", verification_path="native", verification_attention_splits=splits)
+
+
+def test_verification_attention_requires_native_opt_in():
+    with pytest.raises(ValueError, match="explicit native"):
+        RuntimeConfig(model_path="/weights", verification_attention_splits=8)
+    assert RuntimeConfig(model_path="/weights", verification_path="native", verification_attention_splits=8).verification_attention_splits == 8

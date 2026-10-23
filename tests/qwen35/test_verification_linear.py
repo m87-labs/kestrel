@@ -84,7 +84,7 @@ def test_decoder_constructor_failure_releases_projection_owner(fake_plans,monkey
     text.config=SimpleNamespace(hidden_size=4,num_hidden_layers=1,vocab_size=16)
     model=SimpleNamespace(model=SimpleNamespace(language_model=text),lm_head=VerificationLinear(4,16,bias=False))
     runtime=SimpleNamespace(device=torch.device('cuda'),dtype=torch.bfloat16,model=model,
-        _cfg=SimpleNamespace(enable_cuda_graphs=True,verification_path='native'),
+        _cfg=SimpleNamespace(enable_cuda_graphs=True,verification_path='native',verification_attention_splits=None),
         decode_path='generated',max_batch_size=1)
     draft=SimpleNamespace(config=SimpleNamespace(hidden_size=4,target_layer_ids=(0,),
         mask_token_id=0,vocab_size=16,selector_rank=0,block_size=4))
