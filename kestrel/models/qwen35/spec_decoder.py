@@ -609,14 +609,13 @@ class Qwen35DFlashDecoder:
                 if self._generated_verification is not None:
                     # Keep the draft on device until verification completes;
                     # acceptance needs host tokens, but verification does not.
-                    from kestrel_kernels.verification_pointwise_cuda import stage_candidate
+                    from kestrel_kernels.verification_pointwise import stage_candidate
                     width = proposed.numel() + 1
                     candidate = self._candidate_buffers.get(width)
                     if candidate is None:
                         candidate = torch.empty(width, dtype=proposed.dtype, device=proposed.device)
                         self._candidate_buffers[width] = candidate
-                    stage_candidate[(1,)](proposed, candidate, session.bonus, width,
-                                          max(32, 1 << (width - 1).bit_length()))
+                    stage_candidate(proposed, candidate, session.bonus)
                     results = [self._target(candidate, session.cache,
                         session.state.batch_idx, capture=True, leases=leases)]
                     candidates = [candidate.tolist()]
