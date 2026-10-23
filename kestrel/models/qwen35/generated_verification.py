@@ -331,8 +331,11 @@ class Qwen35GeneratedVerification:
 
 def verification_weight_loading_callbacks(runtime):
     """Load eligible large verifiers directly into their final weight slabs."""
-    automatic = runtime.decode_path == "auto"
-    if (runtime.decode_path not in ("generated", "auto")
+    verification_path = runtime._cfg.verification_path
+    if verification_path == "auto":
+        verification_path = runtime.decode_path
+    automatic = verification_path == "auto"
+    if (verification_path not in ("generated", "auto")
             or torch.cuda.get_device_capability(runtime.device) != (9, 0)):
         return None, None
     if automatic and (not runtime._cfg.enable_cuda_graphs or runtime._cfg.page_size != 1

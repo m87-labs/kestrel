@@ -26,6 +26,8 @@ from kestrel.ops.attention import dense_attention, paged_attention
 from kestrel.ops.block_scaled_linear import BlockScaledLinear
 from kestrel.ops.rotary import default_inv_freq
 
+from .verification_linear import VerificationLinear, VerificationProjection
+
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
 from .gdn_state import LinearAttentionState
@@ -199,7 +201,7 @@ def _text_linear(
             in_features, out_features, quantized_rows=quantized_rows,
             interleaved_parts=interleaved_parts,
         )
-    return nn.Linear(in_features, out_features, bias=False)
+    return VerificationLinear(in_features, out_features, bias=False)
 
 
 def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
@@ -956,7 +958,7 @@ class Qwen3_5Experts(nn.Module):
         )
 
 
-class Qwen3_5TopKRouter(nn.Module):
+class Qwen3_5TopKRouter(nn.Module, VerificationProjection):
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
         if config.num_experts is None or config.num_experts_per_tok is None:
@@ -968,7 +970,7 @@ class Qwen3_5TopKRouter(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)
+        router_logits = self.project(hidden_states)
         return get_runtime(router_logits.device).moe.topk_fwd(
             router_logits,
             self.top_k,
@@ -987,7 +989,7 @@ class Qwen3_5SparseMoeBlock(nn.Module):
             config,
             intermediate_size=config.shared_expert_intermediate_size,
         )
-        self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
+        self.shared_expert_gate = VerificationLinear(config.hidden_size, 1, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -1640,7 +1642,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.model = Qwen3_5Model(config)
-        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        self.lm_head = VerificationLinear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
 __all__ = [
     "Qwen3_5VisionModel",

@@ -74,15 +74,12 @@ def test_generated_step_keeps_proposals_on_device_until_verification(cap, expect
     # exhaustive rounding and retained-buffer tests in kestrel-kernels.
     import sys
 
-    class StagingKernel:
-        def __getitem__(self, grid):
-            def launch(proposed, candidate, bonus, width, block):
-                candidate[0] = bonus
-                candidate[1:].copy_(proposed)
-            return launch
+    def stage_candidate(proposed, candidate, bonus):
+        candidate[0] = bonus
+        candidate[1:].copy_(proposed)
 
-    monkeypatch.setitem(sys.modules, "kestrel_kernels.verification_pointwise_cuda",
-                        SimpleNamespace(stage_candidate=StagingKernel()))
+    monkeypatch.setitem(sys.modules, "kestrel_kernels.verification_pointwise",
+                        SimpleNamespace(stage_candidate=stage_candidate))
     obj, state, _, _ = decoder()
     committed, verified_inputs = [], []
     obj._generated_verification = SimpleNamespace(commit=committed.append)
@@ -730,3 +727,51 @@ def test_fixed_verifier_projects_only_consumed_proposals(count, learned_selector
         expected_rows = 16 if learned_selector else 2
         assert torch.equal(result, hidden[:, 1:expected_rows, 0])
     assert torch.equal(projected[0], hidden[:, :expected_rows])
+
+
+@pytest.mark.parametrize("verification,decode,supported,generated", [
+    ("native", "generated", True, False),
+    ("native", "auto", True, False),
+    ("generated", "auto", False, True),
+    ("auto", "generated", False, True),
+    ("auto", "auto", True, True),
+    ("auto", "auto", False, False),
+])
+def test_verification_backend_is_independent(monkeypatch, verification, decode, supported, generated):
+    import kestrel.models.qwen35.spec_decoder as module
+    import kestrel.models.qwen35.generated_verification as generated_module
+    draft = SimpleNamespace(config=SimpleNamespace(hidden_size=4, target_layer_ids=(0,),
+        mask_token_id=0, vocab_size=16, selector_rank=0, block_size=4))
+    text = SimpleNamespace(config=SimpleNamespace(hidden_size=4, num_hidden_layers=1,
+                                                  vocab_size=16), modules=lambda: ())
+    runtime = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16,
+        model=SimpleNamespace(model=SimpleNamespace(language_model=text), lm_head=None),
+        _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path=verification),
+        decode_path=decode, max_batch_size=1)
+    monkeypatch.setattr(module, "load_dflash_drafter", lambda *a, **k: draft)
+    from kestrel.models.qwen35 import verification_linear
+    monkeypatch.setattr(verification_linear, "NativeVerificationProjections", lambda modules: object())
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **k: object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda **k: object())
+    calls=[]
+    class Verifier:
+        segmented=False
+        @staticmethod
+        def supports(*args):
+            calls.append("supports")
+            return supported
+        def __init__(self, *args):
+            calls.append("construct")
+    monkeypatch.setattr(generated_module, "Qwen35GeneratedVerification", Verifier)
+    result = Qwen35DFlashDecoder(runtime, "draft")
+    assert (result._generated_verification is not None) is generated
+    assert runtime.decode_path == decode
+    if verification == "native":
+        assert calls == []  # Explicit native never resolves generated artifacts.
+
+
+def test_target_graph_cannot_capture_outside_verification_scope():
+    obj,_,_,_=decoder()
+    obj._target_graph=object()
+    with pytest.raises(ValueError,match='explicit verification scope'):
+        obj._verify(object(),verification=False)

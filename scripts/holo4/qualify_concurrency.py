@@ -72,7 +72,7 @@ async def run(args):
             tokenizer_path=args.model, draft_model_path=args.draft,
             device='cuda', dtype=torch.bfloat16, max_batch_size=args.batch_capacity,
             page_size=1, kv_cache_pages=args.kv_cache_pages, enable_prefix_cache=False,
-            decode_path=args.decode_path), skills=SkillRegistry([RawChat()]))
+            decode_path=args.decode_path, verification_path=args.verification_path), skills=SkillRegistry([RawChat()]))
 
         async def probe():
             return kernel_observed_sm_mhz(ramp_ms=200)
@@ -166,7 +166,7 @@ async def run(args):
                   max_num_batched_tokens=args.max_num_batched_tokens if args.engine == "vllm" else None,
                   num_speculative_tokens=args.num_speculative_tokens if args.engine == "vllm" and args.draft else None,
                   model=str(args.model), draft=str(args.draft), tokens=args.tokens,
-                  bootstrap=str(args.bootstrap), decode_path=args.decode_path,
+                  bootstrap=str(args.bootstrap), decode_path=args.decode_path, verification_path=args.verification_path,
                   kv_cache_pages=args.kv_cache_pages, complete=False, windows=[], attempts=[])
     versions = {}
     for package in ('torch', 'vllm', 'kestrel', 'kestrel-kernels', 'transformers'):
@@ -261,5 +261,6 @@ if __name__ == '__main__':
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--bootstrap', type=Path)
     parser.add_argument('--decode-path', choices=('auto', 'generated'), default='auto')
+    parser.add_argument('--verification-path', choices=('auto', 'native', 'generated'), default='auto')
     parser.add_argument('--kv-cache-pages', type=int, default=32768)
     asyncio.run(run(parser.parse_args()))

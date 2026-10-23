@@ -19,7 +19,7 @@ def _verification_runtime(*, capacity=1, page_size=1, weight_format="fp8_e4m3"):
                              dense_weight_format=weight_format)
     return SimpleNamespace(
         max_batch_size=capacity, page_size=page_size, device=torch.device("cuda"),
-        dtype=torch.bfloat16, decode_path="auto", _cfg=SimpleNamespace(enable_cuda_graphs=False),
+        dtype=torch.bfloat16, decode_path="auto", _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path="auto"),
         model=SimpleNamespace(model=SimpleNamespace(language_model=SimpleNamespace(config=target))))
 
 
@@ -380,3 +380,15 @@ def test_hopper_extended_capacity_requires_exact_packaged_span(monkeypatch, sequ
     # automatic admission is expanded beyond the existing supported contract.
     runtime._cfg.enable_cuda_graphs = True
     assert not Qwen35GeneratedVerification.supports(runtime, draft)
+
+
+def test_native_verification_loading_never_resolves_generated_inventory(monkeypatch):
+    from kestrel.models.qwen35 import generated_verification as module
+    runtime = _verification_runtime(weight_format="bf16")
+    runtime.decode_path = "generated"
+    runtime._cfg.verification_path = "native"
+    monkeypatch.setattr(torch.cuda, "get_device_capability",
+        lambda device: pytest.fail("native verification must bypass generated loader"))
+    monkeypatch.setattr(module, "resolve_program",
+        lambda **kwargs: pytest.fail("native verification resolved generated inventory"))
+    assert module.verification_weight_loading_callbacks(runtime) == (None, None)

@@ -1,7 +1,7 @@
 """Independent greedy DFlash sessions with automatic target verification."""
 
 from dataclasses import dataclass, replace
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from collections import Counter
 from typing import Any
 import time
@@ -29,6 +29,8 @@ class _Session:
 
 class Qwen35DFlashDecoder:
     """Own independent scheduler rows and pack their target verification."""
+
+    _native_projections = None
 
     def __init__(self, runtime, draft_path):
         if runtime.device.type != "cuda" or runtime.dtype != torch.bfloat16:
@@ -69,8 +71,11 @@ class Qwen35DFlashDecoder:
         self._candidate_buffers = {}
         from .generated_verification import Qwen35GeneratedVerification
 
-        if (runtime.decode_path == "generated" or
-                (runtime.decode_path == "auto" and
+        verification_path = runtime._cfg.verification_path
+        if verification_path == "auto":
+            verification_path = runtime.decode_path
+        if (verification_path == "generated" or
+                (verification_path == "auto" and
                  Qwen35GeneratedVerification.supports(runtime, self.draft))):
             self._generated_verification = Qwen35GeneratedVerification(runtime, self.draft)
             self._generated_verifiers = {1: self._generated_verification}
@@ -105,24 +110,38 @@ class Qwen35DFlashDecoder:
                 self._batch_span_verifiers[sequences] = verifiers
                 self._batch_draft_confidence[sequences] = torch.empty(
                     (sequences, widths[-1] - 1), dtype=torch.float32, device=runtime.device)
-        if runtime._cfg.enable_cuda_graphs and self._generated_verification is None:
-            from .spec_target_graph import Qwen35TargetGraph
-            from .spec_replay_graph import Qwen35ReplayGraph
-            self._target_graph = Qwen35TargetGraph(runtime, self.text,
-                config.target_layer_ids, config.block_size, finalize_stream=self._commit_stream)
-            self._replay_graph = Qwen35ReplayGraph(runtime, config.block_size,
-                target.num_hidden_layers)
+        if runtime._cfg.verification_path == "native":
+            from .verification_linear import NativeVerificationProjections
+            self._native_projections = NativeVerificationProjections(
+                (*self.text.modules(), runtime.model.lm_head))
+        try:
+            if runtime._cfg.enable_cuda_graphs and self._generated_verification is None:
+                from .spec_target_graph import Qwen35TargetGraph
+                from .spec_replay_graph import Qwen35ReplayGraph
+                self._target_graph = Qwen35TargetGraph(runtime, self.text,
+                    config.target_layer_ids, config.block_size, finalize_stream=self._commit_stream)
+                self._replay_graph = Qwen35ReplayGraph(runtime, config.block_size,
+                    target.num_hidden_layers)
+        except BaseException:
+            self.shutdown()
+            raise
 
-    def _verify(self, leases, *, state_sources=None, last_token_only=False, **kwargs):
-        if leases is None or self._target_graph is None:
-            if state_sources is not None:
-                raise RuntimeError("unmaterialized recurrent rows require a verification graph")
-            output = self.text(**kwargs)
-            hidden = output.last_hidden_state
-            if last_token_only:
-                hidden = hidden[:, -1:]
-            return output, self.runtime.model.lm_head(hidden).argmax(-1)
-        return leases.enter_context(self._target_graph.launch(state_sources=state_sources, **kwargs))
+    def _verify(self, leases, *, state_sources=None, last_token_only=False,
+                verification=False, **kwargs):
+        if leases is not None and self._target_graph is not None and not verification:
+            raise ValueError('target graph requires an explicit verification scope')
+        scope = (self._native_projections.activate()
+                 if verification and self._native_projections is not None else nullcontext())
+        with scope:
+            if leases is None or self._target_graph is None:
+                if state_sources is not None:
+                    raise RuntimeError("unmaterialized recurrent rows require a verification graph")
+                output = self.text(**kwargs)
+                hidden = output.last_hidden_state
+                if last_token_only:
+                    hidden = hidden[:, -1:]
+                return output, self.runtime.model.lm_head(hidden).argmax(-1)
+            return leases.enter_context(self._target_graph.launch(state_sources=state_sources, **kwargs))
 
     def shutdown(self):
         self._closed = True
@@ -135,8 +154,12 @@ class Qwen35DFlashDecoder:
                 if self._replay_graph is not None:
                     self._replay_graph.shutdown()
             finally:
-                if self._draft_graph is not None:
-                    self._draft_graph.shutdown()
+                try:
+                    if self._draft_graph is not None:
+                        self._draft_graph.shutdown()
+                finally:
+                    if self._native_projections is not None:
+                        self._native_projections.close()
 
     @property
     def free_slots(self):
@@ -315,7 +338,7 @@ class Qwen35DFlashDecoder:
         slots = page_row[0, positions // page_size].long() * page_size + positions % page_size
         cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
             sequence_lengths=(length,), device=device)
-        output, predictions = self._verify(leases, last_token_only=not capture,
+        output, predictions = self._verify(leases, last_token_only=not capture, verification=capture,
             input_ids=ids, past_key_values=cache, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slots, page_table=page_row,
             paged_kv_seqlens_k=torch.tensor([start+length], device=device, dtype=torch.int32),
@@ -517,7 +540,7 @@ class Qwen35DFlashDecoder:
             if cacheable:
                 self._verification_layouts[lengths] = layout
         cu, topology, state_indices, seq_idx, local_state_indices = layout
-        output, predictions = self._verify(leases, state_sources=sources if graph_staging else None,
+        output, predictions = self._verify(leases, verification=True, state_sources=sources if graph_staging else None,
             input_ids=ids, past_key_values=packed, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slot_mapping, page_table=page_table,
             paged_kv_seqlens_k=torch.tensor([

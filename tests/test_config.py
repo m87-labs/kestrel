@@ -158,3 +158,15 @@ def test_runtime_config_allows_cuda_minor_compatibility_in_message(
     assert "Installed PyTorch is built for CUDA 12.8" in msg
     assert "driver reports CUDA 12.4 support" in msg
     assert "newer than the installed NVIDIA driver supports" not in msg
+
+
+def test_verification_path_is_independent_of_decode_path():
+    cfg = RuntimeConfig(model_path="/weights", device="cpu",
+                        decode_path="generated", verification_path="native")
+    assert cfg.decode_path == "generated"
+    assert cfg.verification_path == "native"
+
+
+def test_verification_path_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="verification_path"):
+        RuntimeConfig(model_path="/weights", verification_path="triton")

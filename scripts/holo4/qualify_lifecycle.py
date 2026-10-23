@@ -33,10 +33,10 @@ async def run(args):
         draft_model_path=args.draft, device='cuda', dtype=torch.bfloat16,
         max_batch_size=args.batch_capacity, page_size=1,
         kv_cache_pages=kv_cache_pages,
-        enable_prefix_cache=False, decode_path=args.decode_path), skills=SkillRegistry([RawChat()]))
+        enable_prefix_cache=False, decode_path=args.decode_path, verification_path=args.verification_path), skills=SkillRegistry([RawChat()]))
     report = dict(complete=False, task_success_evaluated=False, checks=[],
                   runtime=kestrel.__file__, kernels=kestrel_kernels.__file__,
-                  batch_capacity=args.batch_capacity, decode_path=args.decode_path,
+                  batch_capacity=args.batch_capacity, decode_path=args.decode_path, verification_path=args.verification_path,
                   kv_cache_pages=kv_cache_pages)
 
     async def stream(prompt, limit=64, temperature=0):
@@ -164,4 +164,5 @@ if __name__ == '__main__':
     parser.add_argument('--kv-cache-pages', type=int)
     parser.add_argument('--batch-capacity', type=int, choices=range(1, 9), default=1)
     parser.add_argument('--decode-path', choices=('auto', 'generated'), default='auto')
+    parser.add_argument('--verification-path', choices=('auto', 'native', 'generated'), default='auto')
     asyncio.run(asyncio.wait_for(run(parser.parse_args()), timeout=1800))
