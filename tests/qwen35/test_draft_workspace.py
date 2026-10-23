@@ -442,6 +442,9 @@ def test_draft_commits_to_noncontiguous_owner_cache_without_touching_tail():
             value.copy_(original)
             setattr(layer, name, value)
     session = DFlashDraftGraphSession(model, caches)
+    report = session.dispatch_report["context_copy"]
+    assert report["implementation"] == "foreach"
+    assert report["fallback_reason"] == "noncontiguous_cache_layout"
     starts = [cache.length for cache in caches]
     before = [(layer.keys.clone(), layer.values.clone())
               for cache in caches for layer in cache.layers]
@@ -464,3 +467,27 @@ def test_draft_commits_to_noncontiguous_owner_cache_without_touching_tail():
             assert torch.equal(cache.layers[0].values, value)
     finally:
         session.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("owners", [1, 3, 8, 16, 32])
+def test_context_copy_binding_has_no_concurrency_whitelist(owners):
+    from types import SimpleNamespace
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    session = object.__new__(DFlashDraftGraphSession)
+    session.context_rows = 3
+    session.stream = torch.cuda.current_stream()
+    session.workspaces = [SimpleNamespace(
+        keys=torch.empty(owners, 19, 2, 7, device="cuda", dtype=torch.bfloat16),
+        values=torch.empty(owners, 19, 2, 7, device="cuda", dtype=torch.bfloat16))]
+    session.caches = tuple(SimpleNamespace(layers=[SimpleNamespace(
+        keys=torch.empty(1, 16, 2, 7, device="cuda", dtype=torch.bfloat16),
+        values=torch.empty(1, 16, 2, 7, device="cuda", dtype=torch.bfloat16))])
+        for _ in range(owners))
+    session._context_copy_plan = session._bind_context_copy_plan()
+    session._staging_launch_plan = None
+    session._staging_implementation = None
+    report = session.dispatch_report
+    assert report["context_copy"]["implementation"] == "packed"
+    assert report["context_copy"]["fallback_reason"] is None
+    assert len(report["context_copy"]["launch_plan"]["ranges"]) == 1

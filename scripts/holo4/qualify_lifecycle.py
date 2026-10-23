@@ -60,6 +60,26 @@ async def run(args):
         args.output.write_text(json.dumps(report, indent=2))
         print(name, 'passed', flush=True)
 
+    # Observe real serving commits, outside timed qualification. Require a direct
+    # staged launch at the advertised cohort size, not merely a bound kernel.
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    observed_dispatch = {}
+    original_commit = DFlashDraftGraphSession._commit_context
+    def checked_commit(session, lengths):
+        result = original_commit(session, lengths)
+        dispatch = session.dispatch_report
+        copy = dispatch["context_copy"]
+        assert copy["implementation"] == "packed", dispatch
+        assert copy["fallback_reason"] is None, dispatch
+        assert len(copy["launch_plan"]["ranges"]) == 1, dispatch
+        if dispatch["staging_implementation"] is not None:
+            if dispatch["owners"] > 1:
+                assert dispatch["staging_implementation"] == "packed", dispatch
+                assert len(dispatch["staging_launch_plan"]["ranges"]) == 1, dispatch
+            observed_dispatch[dispatch["owners"]] = dispatch
+        return result
+    DFlashDraftGraphSession._commit_context = checked_commit
+
     try:
         assert engine.runtime.spec.decoder._generated_verification is not None
         canaries = [('What is 2 + 2? Reply with only the numeral.', '4'),
@@ -117,9 +137,12 @@ async def run(args):
         # Attention and pointwise Triton kernels may JIT; this gate covers
         # serving without the private megakernel compiler/build toolchain.
         record('no_megakernel_compiler_dependency')
+        assert args.batch_capacity in observed_dispatch, observed_dispatch
+        record('packed_draft_dispatch', observed=observed_dispatch)
         report['complete'] = True
         args.output.write_text(json.dumps(report, indent=2))
     finally:
+        DFlashDraftGraphSession._commit_context = original_commit
         await engine.shutdown()
 
 
