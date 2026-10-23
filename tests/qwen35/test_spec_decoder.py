@@ -644,6 +644,8 @@ def test_confidence_matches_active_draft_geometry(count, batched):
     calls = []
 
     class Draft:
+        config = SimpleNamespace(block_size=4)
+
         def __call__(self, noise, features, positions, **kwargs):
             return noise
 
@@ -701,3 +703,30 @@ def test_batched_calibration_preserves_sequence_geometry_and_selected_span():
     Qwen35DFlashDecoder._target_many(obj, [list(range(4))] * 2, sessions)
     assert selected == [8, 4]
     assert len(measured) == 15
+
+
+@pytest.mark.parametrize('count', [1, 3, 5, 8])
+@pytest.mark.parametrize('learned_selector', [False, True])
+def test_fixed_verifier_projects_only_consumed_proposals(count, learned_selector):
+    obj, _, _, _ = decoder()
+    obj._generated_verification = object()
+    obj._generated_verifiers = {count: SimpleNamespace(block=2)}
+    obj.runtime.model = SimpleNamespace(lm_head=object())
+    hidden = torch.arange(count * 16 * 2).reshape(count, 16, 2)
+    projected = []
+    class Draft:
+        candidate_selector = object() if learned_selector else None
+        config = SimpleNamespace(block_size=16)
+        def __call__(self, *args, **kwargs):
+            return hidden
+        def forward_many(self, *args, **kwargs):
+            return hidden.split(1)
+        def select_tokens(self, value, *args):
+            projected.append(value.clone())
+            return value[:, 1:, 0]
+    obj.draft = Draft()
+    inputs = list(hidden.split(1))
+    with obj._draft_tokens(inputs, inputs, inputs, [object() for _ in range(count)]) as result:
+        expected_rows = 16 if learned_selector else 2
+        assert torch.equal(result, hidden[:, 1:expected_rows, 0])
+    assert torch.equal(projected[0], hidden[:, :expected_rows])

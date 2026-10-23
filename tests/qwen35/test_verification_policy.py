@@ -96,3 +96,16 @@ def test_batched_policy_uses_independent_survival_prefixes_and_joint_cost():
 def test_batched_policy_rejects_invalid_span_inventory(widths):
     with pytest.raises(ValueError, match='verification widths'):
         VerificationWidthPolicy(widths)
+
+
+@pytest.mark.parametrize('widths,sequences', [((2, 4, 8), 2), ((2, 4), 4)])
+@pytest.mark.parametrize('probability', [0., .6, 1.])
+def test_policy_ignores_proposals_beyond_its_largest_verifier(widths, sequences, probability):
+    value = VerificationWidthPolicy(widths)
+    value.set_target_samples({width: [float(width)] * 5 for width in widths})
+    value.record_draft(1.)
+    prefix = [probability] * (widths[-1] - 1)
+    complete = (prefix + [1.] * (15 - len(prefix))) * sequences
+    assert value.choose(prefix * sequences, sequences=sequences) == value.choose(complete, sequences=sequences)
+    with pytest.raises(ValueError, match='complete draft'):
+        value.choose(prefix[:-1] * sequences, sequences=sequences)

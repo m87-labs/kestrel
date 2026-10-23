@@ -151,12 +151,14 @@ def _session_fixture(capacity=64):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_captured_draft_head_matches_eager_projection():
+@pytest.mark.parametrize("proposal_count", [1, 3, 7, 15])
+def test_captured_draft_head_matches_eager_projection(proposal_count):
     from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
     model, caches = _session_fixture()
     head = torch.nn.Linear(128, 257, bias=False).cuda().bfloat16().requires_grad_(False)
     hidden_session = DFlashDraftGraphSession(model, caches)
-    token_session = DFlashDraftGraphSession(model, caches, lm_head=head)
+    token_session = DFlashDraftGraphSession(model, caches, lm_head=head,
+                                                 proposal_count=proposal_count)
     noise = [torch.randn(1, 16, 128, device="cuda", dtype=torch.bfloat16) for _ in caches]
     features = [value[:, :0] for value in noise]
     positions = [torch.arange(cache.length, cache.length + 16, device="cuda")[None]
@@ -164,7 +166,7 @@ def test_captured_draft_head_matches_eager_projection():
     try:
         for _ in range(3):
             with hidden_session.launch(noise, features, positions) as hidden:
-                expected = head(hidden[:, 1:].reshape(1, -1, 128)).argmax(-1).reshape(2, 15)
+                expected = head(hidden[:, 1:].reshape(1, -1, 128)).argmax(-1).reshape(2, 15)[:, :proposal_count]
             with token_session.launch(noise, features, positions) as tokens:
                 assert tokens.dtype == torch.int32
                 assert torch.equal(tokens, expected)
@@ -349,6 +351,7 @@ def test_decoder_reuses_fitting_draft_workspace_and_grows_for_larger_owner():
     from kestrel.models.qwen35.spec_decoder import Qwen35DFlashDecoder
     model, _ = _session_fixture()
     owner = SimpleNamespace(_draft_graph_enabled=True, _draft_graph=None, draft=model,
+                            _generated_verification=None,
                             runtime=SimpleNamespace(model=SimpleNamespace(lm_head=None)))
     sessions = []
     try:
@@ -439,6 +442,9 @@ def test_draft_commits_to_noncontiguous_owner_cache_without_touching_tail():
             value.copy_(original)
             setattr(layer, name, value)
     session = DFlashDraftGraphSession(model, caches)
+    report = session.dispatch_report["context_copy"]
+    assert report["implementation"] == "foreach"
+    assert report["fallback_reason"] == "noncontiguous_cache_layout"
     starts = [cache.length for cache in caches]
     before = [(layer.keys.clone(), layer.values.clone())
               for cache in caches for layer in cache.layers]
@@ -461,3 +467,27 @@ def test_draft_commits_to_noncontiguous_owner_cache_without_touching_tail():
             assert torch.equal(cache.layers[0].values, value)
     finally:
         session.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("owners", [1, 3, 8, 16, 32])
+def test_context_copy_binding_has_no_concurrency_whitelist(owners):
+    from types import SimpleNamespace
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    session = object.__new__(DFlashDraftGraphSession)
+    session.context_rows = 3
+    session.stream = torch.cuda.current_stream()
+    session.workspaces = [SimpleNamespace(
+        keys=torch.empty(owners, 19, 2, 7, device="cuda", dtype=torch.bfloat16),
+        values=torch.empty(owners, 19, 2, 7, device="cuda", dtype=torch.bfloat16))]
+    session.caches = tuple(SimpleNamespace(layers=[SimpleNamespace(
+        keys=torch.empty(1, 16, 2, 7, device="cuda", dtype=torch.bfloat16),
+        values=torch.empty(1, 16, 2, 7, device="cuda", dtype=torch.bfloat16))])
+        for _ in range(owners))
+    session._context_copy_plan = session._bind_context_copy_plan()
+    session._staging_launch_plan = None
+    session._staging_implementation = None
+    report = session.dispatch_report
+    assert report["context_copy"]["implementation"] == "packed"
+    assert report["context_copy"]["fallback_reason"] is None
+    assert len(report["context_copy"]["launch_plan"]["ranges"]) == 1

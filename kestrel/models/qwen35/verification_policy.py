@@ -52,13 +52,15 @@ class VerificationWidthPolicy:
         self.draft_samples.append(elapsed_ms)
 
     def choose(self, confidence, *, sequences=1):
-        if type(sequences) is not int or sequences < 1 or len(confidence) != sequences * 15:
+        if (type(sequences) is not int or sequences < 1 or len(confidence) % sequences
+                or not self.widths[-1] - 1 <= len(confidence) // sequences <= 15):
             raise ValueError('confidence must cover every complete draft block')
         if not self.calibrated or not self.draft_samples:
             return self.widths[-1]
         if any(not math.isfinite(value) or not 0 <= value <= 1 for value in confidence):
             return self.widths[0]
-        survival = [tuple(accumulate(confidence[row * 15:(row + 1) * 15], mul))
+        stride = len(confidence) // sequences
+        survival = [tuple(accumulate(confidence[row * stride:(row + 1) * stride], mul))
                     for row in range(sequences)]
         draft_cost = statistics.median(self.draft_samples)
         overhead = statistics.median(self.cycle_overhead_samples) if self.cycle_overhead_samples else 0.0

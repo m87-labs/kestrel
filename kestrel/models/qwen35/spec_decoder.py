@@ -78,7 +78,7 @@ class Qwen35DFlashDecoder:
                 self._generated_verifiers[sequences] = Qwen35GeneratedVerification(
                     runtime, self.draft, sequences=sequences,
                     weights=self._generated_verification.weights,
-                    **({"verification_rows": {2: 8, 3: 2, 4: 4}[sequences]}
+                    **({"verification_rows": {2: 8, 3: 2, 4: 4}.get(sequences, 2)}
                        if self._generated_verification.segmented else {}))
         if (self._generated_verification is not None
                 and self._generated_verification.segmented and self._draft_graph_enabled
@@ -104,7 +104,7 @@ class Qwen35DFlashDecoder:
                         weights=self._generated_verification.weights, verification_rows=width)
                 self._batch_span_verifiers[sequences] = verifiers
                 self._batch_draft_confidence[sequences] = torch.empty(
-                    (sequences, config.block_size - 1), dtype=torch.float32, device=runtime.device)
+                    (sequences, widths[-1] - 1), dtype=torch.float32, device=runtime.device)
         if runtime._cfg.enable_cuda_graphs and self._generated_verification is None:
             from .spec_target_graph import Qwen35TargetGraph
             from .spec_replay_graph import Qwen35ReplayGraph
@@ -332,6 +332,11 @@ class Qwen35DFlashDecoder:
     def _draft_tokens(self, noise, features, positions, caches, anchors=None):
         confidence = (getattr(self, "_draft_confidence", None) if len(caches) == 1 else
                       getattr(self, "_batch_draft_confidence", {}).get(len(caches)))
+        proposal_count = (self.draft.config.block_size - 1 if confidence is None
+                          else confidence.shape[-1])
+        if (confidence is None and self._generated_verification is not None
+                and self.draft.candidate_selector is None):
+            proposal_count = self._generated_verifiers[len(caches)].block - 1
         eligible = (self._draft_graph_enabled
                     and all(cache.layers for cache in caches)
                     and all(value.shape[1] <= self.draft.config.block_size for value in features))
@@ -341,6 +346,7 @@ class Qwen35DFlashDecoder:
             else:
                 hidden = torch.cat(self.draft.forward_many(
                     noise, features, positions, context_caches=caches), dim=0)
+            hidden = hidden[:, :proposal_count + 1]
             if confidence is None:
                 yield self.draft.select_tokens(hidden, self.runtime.model.lm_head, anchors)
             else:
@@ -349,6 +355,7 @@ class Qwen35DFlashDecoder:
             return
         from .draft_workspace import DFlashDraftGraphSession
         if (self._draft_graph is None or len(self._draft_graph.caches) != len(caches)
+                or self._draft_graph.proposal_count != proposal_count
                 or any(cache.capacity > self._draft_graph.workspaces[0].capacity
                        for cache in caches)):
             if self._draft_graph is not None:
@@ -356,7 +363,7 @@ class Qwen35DFlashDecoder:
                 self._draft_graph = None
             self._draft_graph = DFlashDraftGraphSession(
                 self.draft, caches, lm_head=self.runtime.model.lm_head,
-                confidence=confidence)
+                confidence=confidence, proposal_count=proposal_count)
         elif (any(left is not right for left, right in zip(self._draft_graph.caches, caches))
               or self._draft_graph.lengths != tuple(cache.length for cache in caches)):
             self._draft_graph.rebind(caches)

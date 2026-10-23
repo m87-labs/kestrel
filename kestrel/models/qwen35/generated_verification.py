@@ -35,7 +35,7 @@ def _validate_hopper_contract(runtime, target, draft_config, sequences):
     }
     dimensions_match = all(getattr(target, key, None) == value
                            for key, value in expected.items())
-    if (runtime.max_batch_size not in (1, 2, 3, 4) or not 1 <= sequences <= runtime.max_batch_size
+    if (runtime.max_batch_size not in range(1, 9) or not 1 <= sequences <= runtime.max_batch_size
             or draft_config.block_size != 16 or taps != (1, 6, 11, 16, 22, 27, 32, 37)
             or not dimensions_match or tuple(target.mrope_section) != (11, 11, 10)
             or tuple(target.layer_types) != (("linear_attention",) * 3
@@ -67,8 +67,8 @@ class Qwen35GeneratedVerification:
                    in _PROGRAMS for sequences in range(1, runtime.max_batch_size + 1))
 
     def __init__(self, runtime, draft, *, sequences=1, weights=None, verification_rows=None):
-        if runtime.max_batch_size not in (1, 2, 3, 4) or not 1 <= sequences <= runtime.max_batch_size:
-            raise ValueError("generated DFlash verification supports up to four sequences")
+        if runtime.max_batch_size not in range(1, 9) or not 1 <= sequences <= runtime.max_batch_size:
+            raise ValueError("generated DFlash verification supports up to eight sequences")
         target = runtime.model.model.language_model.config
         taps = tuple(draft.config.target_layer_ids)
         arch = torch.cuda.get_device_capability(runtime.device)
@@ -83,7 +83,7 @@ class Qwen35GeneratedVerification:
         if arch == (9, 0):
             _validate_hopper_contract(runtime, target, draft.config, sequences)
             registration = "qwen35_moe_verification"
-            if sequences > 1 and block not in {2: (2, 4, 8), 3: (2,), 4: (2, 4)}[sequences]:
+            if sequences > 1 and block not in {2: (2, 4, 8), 3: (2,), 4: (2, 4)}.get(sequences, (2,)):
                 raise ValueError("unsupported concurrent Hopper verification span")
             if block not in (2, 3, 4, 5, 6, 7, 8, 16):
                 raise ValueError("unsupported Hopper verification row count")

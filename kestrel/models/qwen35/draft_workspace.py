@@ -79,7 +79,7 @@ class DFlashDraftGraphSession:
     A failed launch/consumer poisons the session rather than attempting rollback.
     """
 
-    def __init__(self, model, caches, *, lm_head=None, confidence=None):
+    def __init__(self, model, caches, *, lm_head=None, confidence=None, proposal_count=None):
         from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
         self.model = model
@@ -93,6 +93,12 @@ class DFlashDraftGraphSession:
         self.closed = False
         self.active = False
         config = model.config
+        if proposal_count is not None and (type(proposal_count) is not int
+                or not 1 <= proposal_count < config.block_size):
+            raise ValueError("proposal count must fit the draft block")
+        self.proposal_count = config.block_size - 1 if proposal_count is None else proposal_count
+        if confidence is not None and confidence.shape[-1] != self.proposal_count:
+            raise ValueError("draft confidence must match the projected proposal count")
         self.context_rows = config.block_size
         self.query_rows = config.block_size
         parameter = next(model.parameters())
@@ -129,11 +135,12 @@ class DFlashDraftGraphSession:
             enabled=True, device=parameter.device, stream=self.stream,
             run_forward=self._forward, max_entries=1)
         self._context_copy_plan = self._bind_context_copy_plan()
+        self._staging_launch_plan = None
+        self._staging_implementation = None
 
     def _bind_context_copy_plan(self):
         """Retain independent cache destinations while this owner cohort lives."""
-        if len(self.caches) not in (2, 4):
-            return None
+        self._context_copy_fallback_reason = None
         from kestrel_kernels.draft_context_copy import DraftContextCopyPlan
         sources, destinations = [], []
         for index, workspace in enumerate(self.workspaces):
@@ -143,13 +150,31 @@ class DFlashDraftGraphSession:
                 tuple(cache.layers[index].values for cache in self.caches)))
         tensors = (*sources, *(value for row in destinations for value in row))
         if any(not value.is_contiguous() for value in tensors):
+            self._context_copy_fallback_reason = "noncontiguous_cache_layout"
             return None
         ranges = sorted((value.data_ptr(), value.data_ptr() + value.numel() * value.element_size())
                         for value in tensors)
         if any(end > following for (_, end), (following, _) in zip(ranges, ranges[1:])):
-            return None
+            raise ValueError("draft context copy requires disjoint owner storage")
         return DraftContextCopyPlan(sources, destinations,
                                     context_rows=self.context_rows, stream=self.stream)
+
+    @property
+    def dispatch_report(self):
+        """Actual bound paths for installed-build qualification; no timing claim."""
+        from dataclasses import asdict
+        copy_plan = self._context_copy_plan
+        return {
+            "owners": len(self.caches),
+            "context_copy": {
+                "implementation": "packed" if copy_plan is not None else "foreach",
+                "fallback_reason": self._context_copy_fallback_reason,
+                "launch_plan": asdict(copy_plan.launch_plan) if copy_plan is not None else None,
+            },
+            "staging_implementation": self._staging_implementation,
+            "staging_launch_plan": (asdict(self._staging_launch_plan)
+                                    if self._staging_launch_plan is not None else None),
+        }
 
     def rebind(self, caches):
         """Replace retired owners whose logical capacities fit retained storage."""
@@ -182,6 +207,8 @@ class DFlashDraftGraphSession:
         self.caches = caches
         self.lengths = tuple(cache.length for cache in caches)
         self._context_copy_plan = self._bind_context_copy_plan()
+        self._staging_launch_plan = None
+        self._staging_implementation = None
 
     def _forward(self, hidden, targets, positions, mapping, used, anchors):
         context = self.model.hidden_norm(self.model.fc(targets))
@@ -209,6 +236,8 @@ class DFlashDraftGraphSession:
             hidden = self.model.norm(hidden)
         if self.lm_head is None:
             return (hidden,)
+        # Keep the complete draft transformer; project only consumed proposals.
+        hidden = hidden[:, :self.proposal_count + 1]
         if self.confidence is not None:
             return (self.model.select_tokens(hidden, self.lm_head, anchors,
                                              confidence=self.confidence),)
@@ -267,6 +296,8 @@ class DFlashDraftGraphSession:
         # on our retained stream; keep their storage live through that copy.
         for value in inputs:
             value.record_stream(self.stream)
+        self._staging_launch_plan = None
+        self._staging_implementation = None
         self.active = True
         try:
             with self.graph.launch(*inputs) as (output,):
@@ -321,8 +352,11 @@ class DFlashDraftGraphSession:
             stage_draft_inputs(features, embedding, inputs, start=cache.length,
                                bonus=bonus, mask_token=self.model.config.mask_token_id,
                                capacity=self.workspaces[0].capacity)
+            self._staging_implementation = "single"
             features.record_stream(self.stream)
             embedding.record_stream(self.stream)
+        self._staging_launch_plan = None
+        self._staging_implementation = None
         self.active = True
         try:
             with self.graph.launch_staged(stage) as (output,):
@@ -355,12 +389,15 @@ class DFlashDraftGraphSession:
             raise ValueError("draft staging cache ownership or capacity mismatch")
         consumer = torch.cuda.current_stream(embedding.device)
         def stage(inputs):
-            stage_draft_inputs_many(features, embedding, inputs, starts=self.lengths,
+            self._staging_launch_plan = stage_draft_inputs_many(features, embedding, inputs, starts=self.lengths,
                 bonuses=bonuses, mask_token=self.model.config.mask_token_id,
                 capacity=self.workspaces[0].capacity)
+            self._staging_implementation = "packed"
             for feature in features:
                 feature.record_stream(self.stream)
             embedding.record_stream(self.stream)
+        self._staging_launch_plan = None
+        self._staging_implementation = None
         self.active = True
         try:
             with self.graph.launch_staged(stage) as (output,):
