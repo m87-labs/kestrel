@@ -4,6 +4,7 @@ from contextvars import ContextVar
 import weakref
 from torch import nn
 from torch.nn import functional as F
+from .verification_attention import VerificationAttention
 
 
 class VerificationProjection:
@@ -30,20 +31,26 @@ class NativeVerificationProjections:
     Prepare after loading/materialization and before graph capture. Other models
     have separate context variables and cannot observe this owner's activation.
     """
-    def __init__(self, modules):
+    def __init__(self, modules, *, attention_splits=None):
         from kestrel_kernels.verification_dense import PreparedDense
+        if attention_splits is not None and (type(attention_splits) is not int or attention_splits not in (1, 2, 4, 8)):
+            raise ValueError("unsupported explicit verification attention split count")
+        self.attention_splits = attention_splits
         self.closed = False
         self.active = ContextVar(f'verification-projections-{id(self)}', default=False)
         owners = tuple(module for module in modules
-                       if isinstance(module, VerificationProjection))
+                       if isinstance(module, VerificationProjection)
+                       or (attention_splits is not None and isinstance(module, VerificationAttention)))
         if any(module._verification_scope is not None for module in owners):
             raise ValueError('verification projections already belong to a runtime')
         # Validate complete inventory before publishing any owner binding.
-        plans = tuple(PreparedDense(module.weight) for module in owners)
+        plans = tuple(PreparedDense(module.weight) if isinstance(module, VerificationProjection) else None
+                      for module in owners)
         self.owners = tuple(weakref.ref(module) for module in owners)
         self.plans = plans
         for module, plan in zip(owners, plans, strict=True):
-            module._verification_projection = plan
+            if plan is not None:
+                module._verification_projection = plan
             module._verification_scope = self
 
     @contextmanager
@@ -65,7 +72,8 @@ class NativeVerificationProjections:
             module = reference()
             if module is not None and module._verification_scope is self:
                 module._verification_scope = None
-                del module._verification_projection
+                if isinstance(module, VerificationProjection):
+                    del module._verification_projection
         self.owners = ()
         self.plans = ()
         self.closed = True

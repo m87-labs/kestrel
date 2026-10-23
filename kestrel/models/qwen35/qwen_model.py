@@ -27,6 +27,7 @@ from kestrel.ops.block_scaled_linear import BlockScaledLinear
 from kestrel.ops.rotary import default_inv_freq
 
 from .verification_linear import VerificationLinear, VerificationProjection
+from .verification_attention import VerificationAttention
 
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
@@ -670,7 +671,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return output
 
 
-class Qwen3_5Attention(nn.Module):
+class Qwen3_5Attention(nn.Module, VerificationAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
@@ -703,6 +704,7 @@ class Qwen3_5Attention(nn.Module):
         paged_kv_seqlens_q: torch.Tensor | None = None,
         paged_kv_seqlens_k: torch.Tensor | None = None,
         cu_seq_lens_q: torch.Tensor | None = None,
+        sequence_lengths: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -772,15 +774,19 @@ class Qwen3_5Attention(nn.Module):
                     cu_seqlens=cu_seq_lens_q,
                 )
             else:
-                attn_output = paged_attention(
-                    query_states,
-                    paged_kv_layer=paged_kv_layer,
-                    page_table=page_table,
-                    paged_kv_seqlens_q=paged_kv_seqlens_q,
-                    paged_kv_seqlens_k=paged_kv_seqlens_k,
-                    cu_seqlens_q=cu_seq_lens_q,
-                    scaling=self.scaling,
-                )
+                attn_output = self.verification_attention(query_states,
+                    cache=past_key_values, paged_kv_layer=paged_kv_layer, page_table=page_table,
+                    used_k=paged_kv_seqlens_k, sequence_lengths=sequence_lengths, scaling=self.scaling)
+                if attn_output is None:
+                    attn_output = paged_attention(
+                        query_states,
+                        paged_kv_layer=paged_kv_layer,
+                        page_table=page_table,
+                        paged_kv_seqlens_q=paged_kv_seqlens_q,
+                        paged_kv_seqlens_k=paged_kv_seqlens_k,
+                        cu_seqlens_q=cu_seq_lens_q,
+                        scaling=self.scaling,
+                    )
             attn_weights = None
 
         attn_output = attn_output * torch.sigmoid(gate)
@@ -1107,6 +1113,7 @@ class Qwen3_5DecoderLayer(nn.Module):
                 paged_kv_seqlens_q=paged_kv_seqlens_q,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 cu_seq_lens_q=cu_seq_lens_q,
+                sequence_lengths=sequence_lengths,
             )
 
         # Fully Connected
