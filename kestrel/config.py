@@ -187,8 +187,13 @@ class RuntimeConfig:
     # their native worker pools. ``None`` lets the runtime choose; ignored off
     # CPU.
     cpu_threads: int | None = None
+    # Speculative target verification is independent of ordinary token decode.
+    # Auto preserves the decode policy; native uses packed prefill kernels.
+    verification_path: DecodePath = "auto"
 
     def __post_init__(self):
+        if self.verification_path not in ("auto", "native", "generated"):
+            raise ValueError("verification_path must be auto, native, or generated")
         if self.draft_model_path is not None:
             from kestrel.models import get_spec
 

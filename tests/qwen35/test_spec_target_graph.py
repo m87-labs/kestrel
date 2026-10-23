@@ -51,11 +51,18 @@ def test_topology_owners_survive_capture_replacement_and_retirement():
             if index == 2:
                 assert owners[0]() is owners[2]()
             if index == 3:
-                assert owners[1]() is None
-        assert owners[1]() is None and owners[4]() is not None
+                # Retiring a graph returns its stream to the pool. A new graph
+                # on that same stream may reuse its still-valid topology.
+                assert owners[1]() is None or owners[1]() is owners[3]()
+            live = [entry[3][1][3] for entry in target._bound_outputs.values()]
+            assert all(ref() is None or any(ref() is token for token in live)
+                       for ref in owners)
+            del live
+        assert owners[4]() is not None
     finally:
         target.shutdown()
     torch.cuda.synchronize(device)
+    assert all(ref() is None for ref in owners)
 
 
 def test_captured_row_packing_matches_packed_inputs_without_mutating_sources():
