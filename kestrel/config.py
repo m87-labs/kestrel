@@ -190,10 +190,17 @@ class RuntimeConfig:
     # Speculative target verification is independent of ordinary token decode.
     # Auto preserves the decode policy; native uses packed prefill kernels.
     verification_path: DecodePath = "auto"
+    # Explicit native verification prefix cap; None preserves the draft block.
+    verification_width: int | None = None
 
     def __post_init__(self):
         if self.verification_path not in ("auto", "native", "generated"):
             raise ValueError("verification_path must be auto, native, or generated")
+        if self.verification_width is not None and (
+            type(self.verification_width) is not int or self.verification_width < 1
+            or self.verification_path != "native"
+        ):
+            raise ValueError("verification_width requires a positive integer and native verification")
         if self.draft_model_path is not None:
             from kestrel.models import get_spec
 

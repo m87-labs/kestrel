@@ -775,3 +775,56 @@ def test_target_graph_cannot_capture_outside_verification_scope():
     obj._target_graph=object()
     with pytest.raises(ValueError,match='explicit verification scope'):
         obj._verify(object(),verification=False)
+
+
+@pytest.mark.parametrize('width', [None, 1, 2, 3, 8, 16])
+def test_explicit_native_prefix_cap_preserves_draft_and_anchor(width):
+    from kestrel.runtime.spec import DraftResult
+    obj = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
+    obj._width_policy = None
+    obj._native_verification_width = width
+    proposed = torch.arange(15).reshape(1,15)
+    obj._propose_fixed = lambda ctx: DraftResult(token_ids=proposed)
+    result = obj.propose(None)
+    count = 15 if width is None else width - 1
+    assert torch.equal(result.token_ids, proposed[:, :count])
+    assert torch.equal(proposed, torch.arange(15).reshape(1,15))
+
+
+@pytest.mark.parametrize('width,path', [(0,'native'),(-1,'native'),(True,'native'),
+    (1.5,'native'),(8,'auto'),(8,'generated')])
+def test_native_width_config_rejects_invalid_cap_before_device_setup(width,path):
+    from kestrel.config import RuntimeConfig
+    with pytest.raises(ValueError, match='verification_width'):
+        RuntimeConfig(model='unused', verification_path=path, verification_width=width)
+
+
+@pytest.mark.parametrize('width', [1, 2, 3])
+def test_native_prefix_cap_applies_to_every_batched_candidate(width):
+    obj, first, commits, _ = decoder()
+    second = add_session(obj)
+    obj._native_verification_width = width
+    seen = []
+    target = obj._target_many
+    def verify(candidates, sessions, *, leases=None):
+        seen.extend(candidates)
+        return target(candidates, sessions, leases=leases)
+    obj._target_many = verify
+    result = obj.step([second, first])
+    assert len(seen) == 2 and all(len(row) == width for row in seen)
+    assert [row[0] for row in seen] == [17, 7]
+    assert all(len(row) <= width for row in result.tokens)
+    assert all(count <= width for count in commits)
+
+
+def test_native_prefix_cap_cannot_exceed_loaded_draft_block(monkeypatch):
+    import kestrel.models.qwen35.spec_decoder as module
+    text = SimpleNamespace(config=SimpleNamespace(hidden_size=4, num_hidden_layers=1, vocab_size=16))
+    draft = SimpleNamespace(config=SimpleNamespace(hidden_size=4, target_layer_ids=(0,),
+        mask_token_id=0, vocab_size=16, selector_rank=0, block_size=4))
+    runtime = SimpleNamespace(model=SimpleNamespace(model=SimpleNamespace(language_model=text)),
+        device=torch.device('cuda'), dtype=torch.bfloat16,
+        _cfg=SimpleNamespace(verification_path='native', verification_width=5))
+    monkeypatch.setattr(module, 'load_dflash_drafter', lambda *args, **kwargs: draft)
+    with pytest.raises(ValueError, match='fit the draft block'):
+        module.Qwen35DFlashDecoder(runtime, 'draft')

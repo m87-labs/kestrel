@@ -47,6 +47,12 @@ class Qwen35DFlashDecoder:
                 or (config.selector_rank and config.vocab_size != target.vocab_size)
                 or config.block_size < 2):
             raise ValueError("DFlash checkpoint does not match target dimensions, taps, or vocabulary")
+        self._native_verification_width = getattr(runtime._cfg, "verification_width", None)
+        if self._native_verification_width is not None and (
+                type(self._native_verification_width) is not int
+                or not 1 <= self._native_verification_width <= config.block_size
+                or runtime._cfg.verification_path != "native"):
+            raise ValueError("native verification width must fit the draft block")
         self.num_speculative_tokens = config.block_size - 1
         self.num_lookahead_tokens = config.block_size
         self._sessions = {}
@@ -396,7 +402,10 @@ class Qwen35DFlashDecoder:
 
     def propose(self, ctx):
         if self._width_policy is None:
-            return self._propose_fixed(ctx)
+            result = self._propose_fixed(ctx)
+            width = getattr(self, '_native_verification_width', None)
+            return (result if width is None else
+                    DraftResult(token_ids=result.token_ids[:, :width-1]))
         warmed = (self._draft_graph is not None and len(self._draft_graph.caches) == 1
                   and bool(ctx.draft_cache.layers)
                   and ctx.draft_cache.capacity <= self._draft_graph.workspaces[0].capacity
@@ -656,6 +665,9 @@ class Qwen35DFlashDecoder:
                         session.state.batch_idx, capture=True, leases=leases)]
             else:
                 candidates = self._propose_many([session for session, _ in sessions])
+                width = getattr(self, '_native_verification_width', None)
+                if width is not None:
+                    candidates = [candidate[:width] for candidate in candidates]
                 results = self._target_many(candidates, [session for session, _ in sessions], leases=leases)
             for (session, cap), candidate, (expected, features, verified) in zip(sessions, candidates, results):
                 accepted = 0
