@@ -114,7 +114,8 @@ class Qwen35DFlashDecoder:
             from .verification_linear import NativeVerificationProjections
             self._native_projections = NativeVerificationProjections(
                 (*self.text.modules(), runtime.model.lm_head),
-                attention_splits=runtime._cfg.verification_attention_splits)
+                attention_splits=runtime._cfg.verification_attention_splits,
+                attention_implementation=runtime._cfg.verification_attention_implementation)
         try:
             if runtime._cfg.enable_cuda_graphs and self._generated_verification is None:
                 from .spec_target_graph import Qwen35TargetGraph

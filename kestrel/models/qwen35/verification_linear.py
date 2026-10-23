@@ -31,10 +31,13 @@ class NativeVerificationProjections:
     Prepare after loading/materialization and before graph capture. Other models
     have separate context variables and cannot observe this owner's activation.
     """
-    def __init__(self, modules, *, attention_splits=None):
+    def __init__(self, modules, *, attention_splits=None, attention_implementation="simt"):
         from kestrel_kernels.verification_dense import PreparedDense
         if attention_splits is not None and (type(attention_splits) is not int or attention_splits not in (1, 2, 4, 8)):
             raise ValueError("unsupported explicit verification attention split count")
+        if attention_implementation not in ('simt', 'packed_mma', 'packed_mma_overlap') or (attention_implementation != 'simt' and attention_splits not in (2, 4, 8)):
+            raise ValueError('unsupported explicit attention implementation/partition count')
+        self.attention_implementation = attention_implementation
         self.attention_splits = attention_splits
         self.closed = False
         self.active = ContextVar(f'verification-projections-{id(self)}', default=False)
