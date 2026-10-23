@@ -137,6 +137,15 @@ async def run(args):
         # Attention and pointwise Triton kernels may JIT; this gate covers
         # serving without the private megakernel compiler/build toolchain.
         record('no_megakernel_compiler_dependency')
+        # Short answer canaries may finish before a full batch is admitted.
+        # Exercise sustained concurrent decode explicitly rather than weakening
+        # the dispatch coverage requirement when those canaries only observe C1.
+        for limit in (512, 2048):
+            if args.batch_capacity in observed_dispatch:
+                break
+            await asyncio.gather(*(finish(
+                'List the integers from 1 to 10000 in ascending order.', limit)
+                for _ in range(args.batch_capacity)))
         assert args.batch_capacity in observed_dispatch, observed_dispatch
         record('packed_draft_dispatch', observed=observed_dispatch)
         report['complete'] = True
