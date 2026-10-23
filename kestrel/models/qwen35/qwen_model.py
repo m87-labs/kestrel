@@ -26,7 +26,7 @@ from kestrel.ops.attention import dense_attention, paged_attention
 from kestrel.ops.block_scaled_linear import BlockScaledLinear
 from kestrel.ops.rotary import default_inv_freq
 
-from .verification_linear import VerificationLinear, VerificationProjection
+from .verification_linear import VerificationLinear, VerificationProjection, VerificationExperts
 
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
@@ -824,7 +824,7 @@ class Qwen3_5MLP(nn.Module):
         return self.down_proj(hidden)
 
 
-class Qwen3_5Experts(nn.Module):
+class Qwen3_5Experts(nn.Module, VerificationExperts):
     """Packed Qwen 3.5 MoE expert weights, matching HF safetensor keys."""
 
     def __init__(self, config: Qwen3_5TextConfig):
@@ -888,6 +888,18 @@ class Qwen3_5Experts(nn.Module):
                     dtype=torch.float32,
                 ),
             )
+    def verification_moe_spec(self, dtype=None):
+        return _MOE_API.MoeSpec(
+            num_experts=self.num_experts,
+            top_k=int(self.top_k),
+            hidden_size=self.hidden_dim,
+            intermediate_size=self.intermediate_dim,
+            activation="swiglu",
+            weight_format=self.expert_weight_format,
+            dtype=self.gate_up_proj.dtype if dtype is None else dtype,
+            backend="auto",
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -909,29 +921,22 @@ class Qwen3_5Experts(nn.Module):
         tokens = int(hidden_states.shape[0])
         if top_k_index.dtype != torch.int32:
             top_k_index = top_k_index.to(torch.int32)
-        spec = _MOE_API.MoeSpec(
-            num_experts=self.num_experts,
-            top_k=int(self.top_k),
-            hidden_size=self.hidden_dim,
-            intermediate_size=self.intermediate_dim,
-            activation="swiglu",
-            weight_format=self.expert_weight_format,
-            dtype=hidden_states.dtype,
-            backend="auto",
-        )
+        spec = self.verification_moe_spec(hidden_states.dtype)
         moe_runtime = get_runtime(hidden_states.device).moe
-        handle = moe_runtime.prepare(
-            spec,
-            _MOE_API.MoeCapacity(
-                max_tokens=tokens,
-                mode=(
-                    "decode"
-                    if tokens <= _KESTREL_MOE_DECODE_MAX_TOKENS
-                    else "prefill"
+        handle = self.verification_moe_handle(spec, hidden_states.device)
+        if handle is None:
+            handle = moe_runtime.prepare(
+                spec,
+                _MOE_API.MoeCapacity(
+                    max_tokens=tokens,
+                    mode=(
+                        "decode"
+                        if tokens <= _KESTREL_MOE_DECODE_MAX_TOKENS
+                        else "prefill"
+                    ),
                 ),
-            ),
-            device=hidden_states.device,
-        )
+                device=hidden_states.device,
+            )
         # Checkpoint loading interleaves gate/up rows for both BF16 and FP8.
         # Single-token BF16 dispatch validates this tag before warpgemv launch.
         pack_kwargs: dict[str, Any] = {

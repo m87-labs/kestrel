@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, replace
 from contextlib import ExitStack, contextmanager, nullcontext
-from collections import Counter
+from collections import Counter, OrderedDict
 from typing import Any
 import time
 
@@ -50,7 +50,7 @@ class Qwen35DFlashDecoder:
         self.num_speculative_tokens = config.block_size - 1
         self.num_lookahead_tokens = config.block_size
         self._sessions = {}
-        self._verification_layouts = {}
+        self._verification_layouts = OrderedDict()
         self._target_graph = None
         self._replay_graph = None
         self._draft_graph = None
@@ -113,7 +113,8 @@ class Qwen35DFlashDecoder:
         if runtime._cfg.verification_path == "native":
             from .verification_linear import NativeVerificationProjections
             self._native_projections = NativeVerificationProjections(
-                (*self.text.modules(), runtime.model.lm_head))
+                (*self.text.modules(), runtime.model.lm_head),
+                max_verification_tokens=config.block_size * runtime.max_batch_size)
         try:
             if runtime._cfg.enable_cuda_graphs and self._generated_verification is None:
                 from .spec_target_graph import Qwen35TargetGraph
@@ -512,7 +513,9 @@ class Qwen35DFlashDecoder:
         self._wait_for_commit()
         device = self.runtime.device
         lengths = tuple(len(tokens) for tokens in candidates)
-        cacheable = lengths == (self.num_lookahead_tokens,) * len(sessions)
+        cacheable = (bool(lengths) and len(set(lengths)) == 1
+                     and 1 <= lengths[0] <= self.num_lookahead_tokens
+                     and len(lengths) <= self.runtime.max_batch_size)
         sources = [session.cache for session in sessions]
         graph_staging = leases is not None and self._target_graph is not None
         packed, branches = Qwen35InferenceCache.fork_packed_recurrent_state(
@@ -538,7 +541,12 @@ class Qwen35DFlashDecoder:
             local_state_indices = torch.zeros_like(state_indices)
             layout = cu, topology, state_indices, seq_idx, local_state_indices
             if cacheable:
+                if len(self._verification_layouts) >= self.runtime.max_batch_size:
+                    self._verification_layouts.pop(next(iter(self._verification_layouts)))
                 self._verification_layouts[lengths] = layout
+        if cacheable:
+            self._verification_layouts.pop(lengths)
+            self._verification_layouts[lengths] = layout
         cu, topology, state_indices, seq_idx, local_state_indices = layout
         output, predictions = self._verify(leases, verification=True, state_sources=sources if graph_staging else None,
             input_ids=ids, past_key_values=packed, position_ids=positions,

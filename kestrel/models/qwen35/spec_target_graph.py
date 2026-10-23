@@ -25,7 +25,7 @@ class Qwen35TargetGraph:
         self._finalize_stream = runtime._compute_stream if finalize_stream is None else finalize_stream
         self._linear = tuple(i for i, kind in enumerate(text.config.layer_types)
                              if kind == 'linear_attention')
-        self._layouts = {}
+        self._layouts = OrderedDict()
         self._prefix_bindings = {}
         self._bound_outputs = OrderedDict()
         self._finalizers = OrderedDict()
@@ -53,13 +53,18 @@ class Qwen35TargetGraph:
             result.extend(owner[row:row + 1] for row in range(count))
         return tuple(result)
 
-    def _layout(self, count, device):
+    def _layout(self, count, device, *, width=None):
+        width = self._block_size if width is None else width
+        if (type(width) is not int or not 1 <= width <= self._block_size
+                or type(count) is not int or not 1 <= count <= self._runtime.max_batch_size):
+            raise ValueError("verification shape exceeds sequence or proposal capacity")
+        key = (count, width)
         stream = torch.cuda.current_stream(device)
-        previous = self._layouts.get(count)
+        previous = self._layouts.get(key)
         if previous is None or previous[0] != stream:
             if not 1 <= count <= self._runtime.max_batch_size:
                 raise ValueError('verification graph exceeds sequence capacity')
-            lengths = (self._block_size,) * count
+            lengths = (width,) * count
             cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
                 sequence_lengths=lengths, device=device)
             cache = Qwen35InferenceCache(config=self._text.config, paged_kv=self._runtime._paged_kv)
@@ -71,13 +76,23 @@ class Qwen35TargetGraph:
             # Separate graph entries own separate capture streams. Sharing a
             # topology would record its storage against a stream that can retire
             # before that storage, and import external waits during capture.
-            self._layouts[count] = stream, (cache, lengths, cu, topology)
-        return self._layouts[count][1]
+            if key not in self._layouts and len(self._layouts) >= self._runtime.max_batch_size:
+                self._layouts.pop(next(iter(self._layouts)))
+            self._layouts[key] = stream, (cache, lengths, cu, topology)
+        # Leased output bindings retain evicted topology owners until replay and
+        # prefix finalization finish; this cache only owns reusable preparation.
+        value = self._layouts.pop(key)
+        self._layouts[key] = value
+        return value[1]
 
     def _forward(self, *values):
         inputs = dict(zip(_INPUTS, values[:len(_INPUTS)], strict=True))
         count = inputs['gdn_state_indices'].numel()
-        cache, lengths, cu, topology = self._layout(count, inputs['input_ids'].device)
+        rows = inputs['input_ids'].shape[1]
+        if count < 1 or rows % count:
+            raise ValueError('verification rows must form equal proposal spans')
+        width = rows // count
+        cache, lengths, cu, topology = self._layout(count, inputs['input_ids'].device, width=width)
         cache._prefix_records = {}
         states = iter(values[len(_INPUTS):])
         row_inputs = len(values) != len(_INPUTS) + 2 * len(self._linear)
@@ -119,7 +134,7 @@ class Qwen35TargetGraph:
                 bindings.append((context.binding_spec, len(owners)))
         # These schemas contain no tensor owners. Each launch binds the actual
         # leased outputs, including after an entry with the same C is recaptured.
-        self._prefix_bindings[count] = tuple(bindings)
+        self._prefix_bindings[(count, width)] = tuple(bindings)
         # Owner-only outputs tie scratch lifetime to the actual graph entry,
         # including when another C replaces the model's workspace cache.
         for index in self._linear:
@@ -137,8 +152,11 @@ class Qwen35TargetGraph:
     def launch(self, *, state_sources=None, **kwargs):
         """Lease verification outputs; direct sources are in sequence order."""
         lengths = tuple(kwargs['sequence_lengths'])
-        if not lengths or any(length != self._block_size for length in lengths):
-            raise ValueError('verification graph requires complete speculative blocks')
+        if (not lengths or any(type(length) is not int or not 1 <= length <= self._block_size
+                               for length in lengths) or len(set(lengths)) != 1):
+            raise ValueError('verification graph requires equal positive proposal spans within capacity')
+        if len(lengths) > self._runtime.max_batch_size:
+            raise ValueError('verification graph exceeds sequence capacity')
         cache = kwargs['past_key_values']
         if cache._prefix_source is None or cache._prefix_records:
             raise RuntimeError('verification graph requires a fresh owned recurrent fork')
@@ -164,7 +182,7 @@ class Qwen35TargetGraph:
                     inputs.extend(getattr(source.layers[index], name) for source in state_sources)
         with self._graphs.launch(*inputs) as values:
             hidden, taps = values[0], values[1:1 + len(self._capture_layers)]
-            _, records, sources, _ = self._bind_outputs(values, len(lengths))
+            _, records, sources, _ = self._bind_outputs(values, len(lengths), width=lengths[0])
             cache._prefix_records = records
             # Prefix finalization consumes the leased records, not a copied full
             # block. Full-block commits detach these states before publication.
@@ -175,7 +193,9 @@ class Qwen35TargetGraph:
             cache._borrowed_recurrent_state = True
             yield _TextModelOutput(hidden, cache, tuple(taps)), values[-1]
 
-    def _bind_outputs(self, values, count):
+    def _bind_outputs(self, values, count, *, width=None):
+        width = self._block_size if width is None else width
+        shape = (count, width)
         # The graph owns one immutable output tuple per entry. Retaining it
         # prevents id reuse and binds opaque contexts only once per capture.
         key = id(values)
@@ -188,7 +208,7 @@ class Qwen35TargetGraph:
                     finalizer[1].shutdown()
             remaining = iter(values[1 + len(self._capture_layers):])
             records, sources = {}, []
-            for index, binding in zip(self._linear, self._prefix_bindings[count], strict=True):
+            for index, binding in zip(self._linear, self._prefix_bindings[shape], strict=True):
                 sources.extend((next(remaining), next(remaining)))
                 record_values = tuple(next(remaining) for _ in _RECORDS)
                 context = None
@@ -199,7 +219,7 @@ class Qwen35TargetGraph:
                     self._text.layers[index].linear_attn, *record_values, context)
             # Retain the topology's private canonical offsets as well as its
             # public tensor when a same-count capture replaces the warmup layout.
-            entry = (values, records, tuple(sources), self._layouts.get(count))
+            entry = (values, records, tuple(sources), self._layouts.get(shape))
             self._bound_outputs[key] = entry
         self._bound_outputs.move_to_end(key)
         return entry

@@ -750,7 +750,7 @@ def test_verification_backend_is_independent(monkeypatch, verification, decode, 
         decode_path=decode, max_batch_size=1)
     monkeypatch.setattr(module, "load_dflash_drafter", lambda *a, **k: draft)
     from kestrel.models.qwen35 import verification_linear
-    monkeypatch.setattr(verification_linear, "NativeVerificationProjections", lambda modules: object())
+    monkeypatch.setattr(verification_linear, "NativeVerificationProjections", lambda modules, **kwargs: object())
     monkeypatch.setattr(torch.cuda, "Stream", lambda **k: object())
     monkeypatch.setattr(torch.cuda, "Event", lambda **k: object())
     calls=[]
