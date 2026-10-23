@@ -192,10 +192,15 @@ class RuntimeConfig:
     verification_path: DecodePath = "auto"
     # Explicit diagnostic candidate; no automatic cost selection.
     verification_attention_splits: int | None = None
+    verification_attention_implementation: str = "simt"
 
     def __post_init__(self):
         if self.verification_path not in ("auto", "native", "generated"):
             raise ValueError("verification_path must be auto, native, or generated")
+        if self.verification_attention_implementation not in ('simt', 'packed_mma', 'packed_mma_overlap'):
+            raise ValueError('unsupported explicit verification attention implementation')
+        if self.verification_attention_implementation != 'simt' and self.verification_attention_splits not in (2, 4, 8):
+            raise ValueError('packed MMA verification attention requires 2/4/8 explicit partitions')
         if self.verification_attention_splits is not None:
             if (type(self.verification_attention_splits) is not int
                     or self.verification_attention_splits not in (1, 2, 4, 8)

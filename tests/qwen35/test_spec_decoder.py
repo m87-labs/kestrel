@@ -746,7 +746,7 @@ def test_verification_backend_is_independent(monkeypatch, verification, decode, 
                                                   vocab_size=16), modules=lambda: ())
     runtime = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16,
         model=SimpleNamespace(model=SimpleNamespace(language_model=text), lm_head=None),
-        _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path=verification, verification_attention_splits=None),
+        _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path=verification, verification_attention_splits=None, verification_attention_implementation="simt"),
         decode_path=decode, max_batch_size=1)
     monkeypatch.setattr(module, "load_dflash_drafter", lambda *a, **k: draft)
     from kestrel.models.qwen35 import verification_linear

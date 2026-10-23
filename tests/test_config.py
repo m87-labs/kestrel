@@ -182,3 +182,10 @@ def test_verification_attention_requires_native_opt_in():
     with pytest.raises(ValueError, match="explicit native"):
         RuntimeConfig(model_path="/weights", verification_attention_splits=8)
     assert RuntimeConfig(model_path="/weights", verification_path="native", verification_attention_splits=8).verification_attention_splits == 8
+
+
+@pytest.mark.parametrize('implementation,splits', [('unknown',8),('packed_mma',None),('packed_mma',1)])
+def test_verification_attention_rejects_unsupported_implementation(implementation,splits):
+    with pytest.raises(ValueError):
+        RuntimeConfig(model_path='/weights',verification_path='native',verification_attention_splits=splits,
+                      verification_attention_implementation=implementation)
