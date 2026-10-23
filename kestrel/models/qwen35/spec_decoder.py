@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, replace
 from contextlib import ExitStack, contextmanager, nullcontext
-from collections import Counter
+from collections import Counter, OrderedDict
 from typing import Any
 import time
 
@@ -47,10 +47,16 @@ class Qwen35DFlashDecoder:
                 or (config.selector_rank and config.vocab_size != target.vocab_size)
                 or config.block_size < 2):
             raise ValueError("DFlash checkpoint does not match target dimensions, taps, or vocabulary")
+        self._native_verification_width = getattr(runtime._cfg, "verification_width", None)
+        if self._native_verification_width is not None and (
+                type(self._native_verification_width) is not int
+                or not 1 <= self._native_verification_width <= config.block_size
+                or runtime._cfg.verification_path != "native"):
+            raise ValueError("native verification width must fit the draft block")
         self.num_speculative_tokens = config.block_size - 1
         self.num_lookahead_tokens = config.block_size
         self._sessions = {}
-        self._verification_layouts = {}
+        self._verification_layouts = OrderedDict()
         self._target_graph = None
         self._replay_graph = None
         self._draft_graph = None
@@ -113,7 +119,8 @@ class Qwen35DFlashDecoder:
         if runtime._cfg.verification_path == "native":
             from .verification_linear import NativeVerificationProjections
             self._native_projections = NativeVerificationProjections(
-                (*self.text.modules(), runtime.model.lm_head))
+                (*self.text.modules(), runtime.model.lm_head),
+                max_verification_tokens=config.block_size * runtime.max_batch_size)
         try:
             if runtime._cfg.enable_cuda_graphs and self._generated_verification is None:
                 from .spec_target_graph import Qwen35TargetGraph
@@ -395,7 +402,10 @@ class Qwen35DFlashDecoder:
 
     def propose(self, ctx):
         if self._width_policy is None:
-            return self._propose_fixed(ctx)
+            result = self._propose_fixed(ctx)
+            width = getattr(self, '_native_verification_width', None)
+            return (result if width is None else
+                    DraftResult(token_ids=result.token_ids[:, :width-1]))
         warmed = (self._draft_graph is not None and len(self._draft_graph.caches) == 1
                   and bool(ctx.draft_cache.layers)
                   and ctx.draft_cache.capacity <= self._draft_graph.workspaces[0].capacity
@@ -512,7 +522,9 @@ class Qwen35DFlashDecoder:
         self._wait_for_commit()
         device = self.runtime.device
         lengths = tuple(len(tokens) for tokens in candidates)
-        cacheable = lengths == (self.num_lookahead_tokens,) * len(sessions)
+        cacheable = (bool(lengths) and len(set(lengths)) == 1
+                     and 1 <= lengths[0] <= self.num_lookahead_tokens
+                     and len(lengths) <= self.runtime.max_batch_size)
         sources = [session.cache for session in sessions]
         graph_staging = leases is not None and self._target_graph is not None
         packed, branches = Qwen35InferenceCache.fork_packed_recurrent_state(
@@ -538,7 +550,12 @@ class Qwen35DFlashDecoder:
             local_state_indices = torch.zeros_like(state_indices)
             layout = cu, topology, state_indices, seq_idx, local_state_indices
             if cacheable:
+                if len(self._verification_layouts) >= self.runtime.max_batch_size:
+                    self._verification_layouts.pop(next(iter(self._verification_layouts)))
                 self._verification_layouts[lengths] = layout
+        if cacheable:
+            self._verification_layouts.pop(lengths)
+            self._verification_layouts[lengths] = layout
         cu, topology, state_indices, seq_idx, local_state_indices = layout
         output, predictions = self._verify(leases, verification=True, state_sources=sources if graph_staging else None,
             input_ids=ids, past_key_values=packed, position_ids=positions,
@@ -648,6 +665,9 @@ class Qwen35DFlashDecoder:
                         session.state.batch_idx, capture=True, leases=leases)]
             else:
                 candidates = self._propose_many([session for session, _ in sessions])
+                width = getattr(self, '_native_verification_width', None)
+                if width is not None:
+                    candidates = [candidate[:width] for candidate in candidates]
                 results = self._target_many(candidates, [session for session, _ in sessions], leases=leases)
             for (session, cap), candidate, (expected, features, verified) in zip(sessions, candidates, results):
                 accepted = 0

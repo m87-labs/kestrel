@@ -98,3 +98,56 @@ def test_decoder_constructor_failure_releases_projection_owner(fake_plans,monkey
             spec_decoder.Qwen35DFlashDecoder(runtime,'draft')
         assert text.proj._verification_scope is None
         assert model.lm_head._verification_scope is None
+
+
+def test_expert_plans_share_only_within_one_owner(fake_plans, monkeypatch):
+    from kestrel.models.qwen35.verification_linear import VerificationExperts
+    from kestrel_kernels.moe.api import MoeSpec
+    built = []
+    class Experts(torch.nn.Module, VerificationExperts):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = torch.empty(1, dtype=torch.bfloat16)
+        def verification_moe_spec(self):
+            return MoeSpec(16, 8, 128, 128)
+    class Plan:
+        @classmethod
+        def from_generated(cls, spec, *, max_tokens, device):
+            built.append((spec, max_tokens, device))
+            return SimpleNamespace(prepare=lambda capacity: SimpleNamespace(
+                spec=spec, device=device, capacity=capacity))
+    monkeypatch.setitem(sys.modules, 'kestrel_kernels.moe.padded_plan', SimpleNamespace(PaddedMoePlan=Plan))
+    a, b, c = Experts(), Experts(), Experts()
+    owner = NativeVerificationProjections([a,b], max_verification_tokens=128)
+    other = NativeVerificationProjections([c], max_verification_tokens=128)
+    assert len(built) == 2
+    assert a._verification_experts is b._verification_experts
+    assert a._verification_experts is not c._verification_experts
+    spec, device = a.verification_moe_spec(), a.gate_up_proj.device
+    assert a.verification_moe_handle(spec, device) is None
+    with owner.activate():
+        assert a.verification_moe_handle(spec, device) is a._verification_experts
+        assert c.verification_moe_handle(spec, device) is None
+        with pytest.raises(ValueError, match='spec/device'):
+            a.verification_moe_handle(spec, torch.device('cuda:0'))
+    owner.close()
+    assert not hasattr(a, '_verification_experts')
+    assert a._verification_scope is b._verification_scope is None
+    with other.activate():
+        assert c.verification_moe_handle(spec, device) is c._verification_experts
+    other.close()
+
+
+def test_expert_plan_failure_does_not_publish_dense_binding(fake_plans, monkeypatch):
+    from kestrel.models.qwen35.verification_linear import VerificationExperts
+    class Experts(torch.nn.Module, VerificationExperts):
+        gate_up_proj = torch.empty(1)
+        def verification_moe_spec(self): return None
+    def fail(*args, **kwargs): raise ValueError('unsupported execution domain')
+    monkeypatch.setitem(sys.modules, 'kestrel_kernels.moe.padded_plan',
+                        SimpleNamespace(PaddedMoePlan=SimpleNamespace(from_generated=fail)))
+    a, b = VerificationLinear(4,4,bias=False), Experts()
+    with pytest.raises(ValueError, match='execution domain'):
+        NativeVerificationProjections([a,b], max_verification_tokens=128)
+    assert a._verification_scope is b._verification_scope is None
+    assert not hasattr(a, '_verification_projection')
