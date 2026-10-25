@@ -16,6 +16,8 @@ def decoder():
     obj._batch_span_verifiers = {}
     obj._batch_draft_confidence = {}
     obj._draft_graph = None
+    from kestrel.models.qwen35.draft_owner_cache import DraftOwnerCache
+    obj._draft_owners = DraftOwnerCache(max_entries=4, known_tensor_bytes=1024)
     obj._target_graph = None
     obj._replay_graph = None
     obj._draft_graph = None
@@ -748,7 +750,7 @@ def test_verification_backend_is_independent(monkeypatch, verification, decode, 
                                                   vocab_size=16), modules=lambda: ())
     runtime = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16,
         model=SimpleNamespace(model=SimpleNamespace(language_model=text), lm_head=None),
-        _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path=verification, verification_projection_path="canonical", verification_attention_splits=None, verification_attention_implementation="simt"),
+        _cfg=SimpleNamespace(draft_graph_cache_entries=4, draft_graph_known_tensor_bytes=1024, enable_cuda_graphs=False, verification_path=verification, verification_projection_path="canonical", verification_attention_splits=None, verification_attention_implementation="simt"),
         decode_path=decode, max_batch_size=1)
     monkeypatch.setattr(module, "load_dflash_drafter", lambda *a, **k: draft)
     from kestrel.models.qwen35 import verification_linear
