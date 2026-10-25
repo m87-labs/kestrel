@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from .qwen_model import _RecurrentPrefixRecord
 
 
-def _finalize_recurrent_prefixes(records, accepted_lengths):
+def _finalize_recurrent_prefixes(records, accepted_lengths, *, include_histories=True):
     """Return layer/row-ordered leased state/history pairs without changing owners."""
     from kestrel_kernels import get_runtime
 
@@ -38,6 +38,8 @@ def _finalize_recurrent_prefixes(records, accepted_lengths):
     get_runtime().gated_delta.finalize_packed_gated_delta_prefix(
         tuple(record.prefix_context for record in ordered), accepted_lengths,
         out_states=states)
+    if not include_histories:
+        return tuple(state[row:row + 1] for state in states for row in range(count))
     lengths = accepted_lengths.to(torch.int64)
     positions = {}
     outputs = []
@@ -226,7 +228,7 @@ class Qwen35InferenceCache:
         return packed, branches
 
     @staticmethod
-    def commit_recurrent_prefixes(caches, lengths, *, finalizer=None, _destinations=None):
+    def commit_recurrent_prefixes(caches, lengths, *, finalizer=None, _destinations=None, history_writer=None):
         """Finalize one packed verification before publishing any cache state."""
         from contextlib import nullcontext
 
@@ -286,7 +288,7 @@ class Qwen35InferenceCache:
         else:
             lease = finalizer(records, accepted)
         with lease as outputs:
-            if len(outputs) != 2 * len(indices) * count:
+            if len(outputs) != (2 if history_writer is None else 1) * len(indices) * count:
                 raise ValueError("packed prefix finalizer requires state/history pairs")
             # Allocate after submission to overlap host work with finalization.
             # Destinations remain detached until every state/history is written.
@@ -311,15 +313,19 @@ class Qwen35InferenceCache:
             values = iter(outputs)
             for index in indices:
                 for result in results:
-                    state, history = next(values), next(values)
+                    state = next(values)
+                    history = next(values) if history_writer is None else None
                     layer = result.layers[index]
                     state_destinations.append(layer.recurrent_states)
                     states.append(state)
                     conv_destinations.append(layer.conv_states)
                     histories.append(history)
                     layer.has_previous_state = True
+            if history_writer is not None:
+                history_writer(records, results, lengths, accepted)
             torch._foreach_copy_(state_destinations, states)
-            torch._foreach_copy_(conv_destinations, histories)
+            if history_writer is None:
+                torch._foreach_copy_(conv_destinations, histories)
         for cache, result, length in zip(caches, results, lengths):
             result.advance_to(cache._prefix_start + length)
             cache._prefix_records = {}

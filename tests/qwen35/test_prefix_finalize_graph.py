@@ -53,6 +53,7 @@ def test_row_output_lease_reuse_and_cancellation(monkeypatch, device, capture):
         _compute_stream=torch.cuda.Stream(device=device) if capture else None)
     graph._finalize_stream = graph._runtime._compute_stream
     graph._finalizers, graph._bound_outputs = OrderedDict(), OrderedDict()
+    graph._history_plans = OrderedDict()
     graph._layouts, graph._prefix_bindings = {}, {}
     graph._graphs = SimpleNamespace(shutdown=lambda: None)
     template = torch.zeros(8, 2, 3, 3, device=device)
@@ -109,6 +110,7 @@ def test_same_shape_target_recapture_rebinds_finalizer_and_releases_evicted_owne
                                      _compute_stream=None)
     graph._finalize_stream = None
     graph._finalizers = OrderedDict()
+    graph._history_plans = OrderedDict()
     graph._bound_outputs = OrderedDict()
     graph._graphs = SimpleNamespace(shutdown=lambda: None)
     graph._layouts = {}
@@ -203,6 +205,7 @@ def test_bound_target_entry_reuses_records_and_evicts_matching_finalizer(monkeyp
                                      _compute_stream=None)
     graph._finalize_stream = None
     graph._finalizers = OrderedDict()
+    graph._history_plans = OrderedDict()
     graph._bound_outputs = OrderedDict()
     graph._capture_layers = ()
     graph._linear = (0,)
@@ -240,3 +243,20 @@ def test_bound_target_entry_reuses_records_and_evicts_matching_finalizer(monkeyp
     del result
     graph.shutdown()
     assert _Graph.instances[1].closed and not graph._bound_outputs
+
+
+def test_direct_history_plan_rejects_replaced_producer_source():
+    graph = object.__new__(spec_target_graph.Qwen35TargetGraph)
+    graph._runtime = SimpleNamespace(max_batch_size=2)
+    graph._history_plans = OrderedDict()
+    records = {0: SimpleNamespace(conv_input=torch.arange(44.).view(1,2,22),
+                                  module=SimpleNamespace(conv_kernel_size=4))}
+    destinations = tuple(SimpleNamespace(layers=(SimpleNamespace(conv_states=torch.empty(1,2,4)),))
+                         for _ in range(2))
+    accepted = torch.tensor([1,8],dtype=torch.int32)
+    graph.write_histories(records,destinations,(1,8),accepted)
+    before = tuple(owner.layers[0].conv_states.clone() for owner in destinations)
+    records[0].conv_input = records[0].conv_input.clone()
+    with pytest.raises(RuntimeError,match='source ownership changed'):
+        graph.write_histories(records,destinations,(1,8),accepted)
+    assert all(torch.equal(owner.layers[0].conv_states,old) for owner,old in zip(destinations,before))

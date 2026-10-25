@@ -461,3 +461,61 @@ def test_eager_history_finalization_transaction(monkeypatch, fail_gather):
         for index, layer in enumerate(source.layers):
             assert torch.all(layer.recurrent_states == row + index * 10)
             assert torch.all(layer.conv_states == row + index * 10)
+
+
+@pytest.mark.parametrize('count', [1, 2, 4, 8, 17])
+@pytest.mark.parametrize('token_major', [False, True])
+def test_direct_history_writer_keeps_state_and_history_owners(count, token_major):
+    from kestrel_kernels.prefix_history import PrefixHistoryPlan
+    sources, branches, _ = _packed_prefixes(count=count, layers=3, block=8)
+    if token_major:
+        for record in branches[0]._prefix_records.values():
+            # Match the model: concatenate sequence-major history/query pieces,
+            # then expose channels without materializing a transpose.
+            parts = record.conv_input.split(11, dim=-1)
+            record.conv_input = torch.cat(tuple(part.transpose(1,2) for part in parts), dim=1).transpose(1,2)
+            assert record.conv_input.stride(1) == 1
+    snapshots = [[(layer.conv_states.clone(), layer.recurrent_states.clone())
+                  for layer in source.layers] for source in sources]
+    lengths = tuple(1 + row % 8 for row in range(count))
+
+    @contextmanager
+    def finalize(records, accepted):
+        yield tuple(torch.full_like(records[index].initial_state[row:row+1], index*10+row)
+                    for index in sorted(records) for row in range(count))
+
+    def histories(records, destinations, host_lengths, accepted):
+        assert host_lengths == lengths
+        plan = PrefixHistoryPlan(tuple(records[i].conv_input for i in sorted(records)),
+            tuple(tuple(cache.layers[i].conv_states for cache in destinations) for i in sorted(records)),
+            widths=(4,)*3, block=8)
+        plan.run(host_lengths, accepted)
+
+    results = Qwen35InferenceCache.commit_recurrent_prefixes(
+        branches, lengths, finalizer=finalize, history_writer=histories)
+    for row, (result, source, before) in enumerate(zip(results, sources, snapshots)):
+        for index, layer in enumerate(result.layers):
+            assert torch.all(layer.recurrent_states == index*10+row)
+            original = branches[row]._prefix_records
+            assert original == {}
+            for actual, expected in zip((source.layers[index].conv_states,
+                                         source.layers[index].recurrent_states), before[index]):
+                assert torch.equal(actual, expected)
+            values=(torch.arange(count*2*11).reshape(2,count,11)+index*1000).to(torch.bfloat16)
+            assert torch.equal(layer.conv_states[0], values[:,row,lengths[row]-1:lengths[row]+3])
+
+
+def test_history_writer_failure_does_not_publish_or_copy_recurrent_states():
+    sources, branches, _ = _packed_prefixes()
+    records = branches[0]._prefix_records
+    @contextmanager
+    def finalize(records, accepted):
+        yield tuple(torch.full_like(records[0].initial_state[row:row+1],99) for row in range(2))
+    def fail(*args):
+        raise RuntimeError('history launch failed')
+    with pytest.raises(RuntimeError,match='history launch failed'):
+        Qwen35InferenceCache.commit_recurrent_prefixes(branches,(2,3),
+            finalizer=finalize,history_writer=fail)
+    assert branches[0]._prefix_records is records
+    for row, source in enumerate(sources):
+        assert torch.all(source.layers[0].recurrent_states == row)

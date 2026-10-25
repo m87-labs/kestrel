@@ -29,6 +29,7 @@ class Qwen35TargetGraph:
         self._prefix_bindings = {}
         self._bound_outputs = OrderedDict()
         self._finalizers = OrderedDict()
+        self._history_plans = OrderedDict()
         self._graphs = FixedShapeSinglePassGraph(
             enabled=True, device=runtime.device, stream=runtime._compute_stream,
             run_forward=self._forward, max_entries=runtime.max_batch_size,
@@ -211,9 +212,13 @@ class Qwen35TargetGraph:
         if entry is None:
             if len(self._bound_outputs) >= self._runtime.max_batch_size:
                 _, (_, retired, _, _) = self._bound_outputs.popitem(last=False)
-                finalizer = self._finalizers.pop(id(retired), None)
-                if finalizer is not None:
-                    finalizer[1].shutdown()
+                for history_key, (producer, _) in tuple(self._history_plans.items()):
+                    if producer is retired:
+                        del self._history_plans[history_key]
+                for include_histories in (False, True):
+                    finalizer = self._finalizers.pop((id(retired), include_histories), None)
+                    if finalizer is not None:
+                        finalizer[1].shutdown()
             remaining = iter(values[1 + len(self._capture_layers):])
             records, sources = {}, []
             for index, binding in zip(self._linear, self._prefix_bindings[shape], strict=True):
@@ -233,9 +238,9 @@ class Qwen35TargetGraph:
         return entry
 
     @contextmanager
-    def finalize_prefixes(self, records, accepted_lengths):
+    def finalize_prefixes(self, records, accepted_lengths, *, include_histories=True):
         """Bind finalization to the producing entry, not merely its batch size."""
-        key = id(records)
+        key = (id(records), include_histories)
         entry = self._finalizers.get(key)
         if entry is None:
             if len(self._finalizers) >= self._runtime.max_batch_size:
@@ -244,7 +249,7 @@ class Qwen35TargetGraph:
             indices = tuple(sorted(records))
             contexts = tuple(records[index].prefix_context for index in indices)
             def forward(lengths):
-                return _finalize_recurrent_prefixes(records, lengths)
+                return _finalize_recurrent_prefixes(records, lengths, include_histories=include_histories)
 
             graph = FixedShapeSinglePassGraph(
                 enabled=all(context.supports_graph_capture for context in contexts),
@@ -256,6 +261,30 @@ class Qwen35TargetGraph:
         with entry[1].launch(accepted_lengths) as outputs:
             yield outputs
 
+    def write_histories(self, records, destinations, lengths, accepted):
+        from kestrel_kernels.prefix_history import PrefixHistoryPlan
+
+        indices = tuple(sorted(records))
+        sources = tuple(records[index].conv_input for index in indices)
+        outputs = tuple(tuple(cache.layers[index].conv_states for cache in destinations)
+                        for index in indices)
+        key = (id(records), tuple(id(t) for row in outputs for t in row))
+        entry = self._history_plans.get(key)
+        if entry is not None and entry[0] is not records:
+            raise RuntimeError("history plan producer ownership changed")
+        plan = None if entry is None else entry[1]
+        if plan is not None and any(current is not bound for current, bound in zip(sources, plan.sources, strict=True)):
+            raise RuntimeError("history plan source ownership changed")
+        if plan is None:
+            widths = tuple(records[index].module.conv_kernel_size for index in indices)
+            block = sources[0].shape[-1] // len(destinations) - widths[0] + 1
+            plan = PrefixHistoryPlan(sources, outputs, widths=widths, block=block)
+            if len(self._history_plans) >= 2 * self._runtime.max_batch_size:
+                self._history_plans.popitem(last=False)
+            self._history_plans[key] = (records, plan)
+        self._history_plans.move_to_end(key)
+        plan.run(lengths, accepted)
+
     def shutdown(self):
         try:
             self._graphs.shutdown()
@@ -263,6 +292,7 @@ class Qwen35TargetGraph:
             for _, graph in self._finalizers.values():
                 graph.shutdown()
             self._finalizers.clear()
+            self._history_plans.clear()
             self._bound_outputs.clear()
             self._layouts.clear()
             self._prefix_bindings.clear()

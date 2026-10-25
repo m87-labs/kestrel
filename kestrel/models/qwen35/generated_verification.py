@@ -394,6 +394,8 @@ def validate_verification_capabilities(runtime, target_config):
     if path == "native":
         from .query_metadata import require_query_metadata
         require_query_metadata(runtime.device)
+        from kestrel_kernels.prefix_history import require_prefix_history
+        require_prefix_history(runtime.device, runtime.dtype)
         return
     from .dflash import DFlashConfig
     draft = DFlashConfig.from_dict(json.loads(
@@ -407,6 +409,8 @@ def validate_verification_capabilities(runtime, target_config):
             probe, SimpleNamespace(config=draft)):
         from .query_metadata import require_query_metadata
         require_query_metadata(runtime.device)
+        from kestrel_kernels.prefix_history import require_prefix_history
+        require_prefix_history(runtime.device, runtime.dtype)
         return
     required = [("verification_pointwise", "stage_candidate")]
     if torch.cuda.get_device_capability(runtime.device) == (9, 0):
