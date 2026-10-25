@@ -77,13 +77,10 @@ for count in range(bounds['sequences'].lower, bounds['sequences'].upper + 1):
         if not context.supports_graph_capture:
             raise RuntimeError(f'missing native prefix runtime route: {nk=}, {nv=}, {dk=}, {dv=}, {width=}, {count=}')
         stages = {}
-        with capture_packed_artifact_receipts() as prepare_artifacts:
-            r.packed_prefill_prepare(mixed,gate,beta,log_decay,bias,query=workspace.query,key=workspace.key,value=workspace.value,g=workspace.log_g,beta=workspace.beta_fp32)
-        stages['prepare'] = prepare_artifacts.receipts
         def execute():
             with capture_packed_artifact_receipts() as verify_artifacts:
                 out,_ = r.packed_gated_delta_rule_prefill(mixed,gate,beta,log_decay,bias,cu,workspace=workspace,initial_state=initial,output_final_state=False,sequence_lengths=(width,)*count,topology_token=topology,prefix_context=context)
-            stages['verify'] = verify_artifacts.receipts
+            stages['prepare_and_verify'] = verify_artifacts.receipts
             with capture_packed_artifact_receipts() as finalize_artifacts:
                 r.finalize_packed_gated_delta_prefix([context],lengths,out_states=[state])
             stages['finalize'] = finalize_artifacts.receipts
