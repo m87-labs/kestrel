@@ -221,3 +221,24 @@ def test_config_default_retains_four_owners_with_explicit_budget():
     assert cfg.draft_graph_known_tensor_bytes==4*1024**3
     with pytest.raises(ValueError,match='cache bounds'):
         RuntimeConfig(draft_graph_cache_entries=True)
+
+
+
+def test_overlapping_same_owner_lease_and_pin_preserve_first_user():
+    from concurrent.futures import ThreadPoolExecutor
+    cache=DraftOwnerCache(max_entries=1,known_tensor_bytes=10)
+    with cache.lease('a',10,Owner) as owner:
+        def overlapping():
+            with pytest.raises(RuntimeError,match='exclusive lease'):
+                with cache.lease('a',10,Owner): pass
+            with pytest.raises(RuntimeError,match='exclusive lease'):
+                with cache.pin(owner): pass
+        overlapping()
+        with ThreadPoolExecutor(max_workers=1) as pool: pool.submit(overlapping).result()
+        assert not owner.failed and not owner.closed
+    with cache.pin(owner):
+        with pytest.raises(RuntimeError,match='exclusive lease'):
+            with cache.pin(owner): pass
+        assert not owner.failed
+    with cache.lease('a',10,Owner) as same: assert same is owner
+    cache.shutdown(); assert owner.closes==1

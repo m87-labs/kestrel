@@ -38,6 +38,10 @@ class DraftOwnerCache:
                               if not o.closed and not o.failed and compatible(candidate)]
                 if candidates:
                     key = min(candidates, key=lambda item: item[0])[1]
+            if key in self._entries:
+                retained = self._entries[key][0]
+                if retained.active or self._pins.get(id(retained), 0):
+                    raise RuntimeError('draft owner already has an exclusive lease')
             if key in self._entries and (self._entries[key][0].failed or self._entries[key][0].closed):
                 self._retire(key)
             if key not in self._entries:
@@ -81,6 +85,8 @@ class DraftOwnerCache:
         with self._lock:
             if self.closed or owner.closed or owner.failed or not any(o is owner for o, _ in self._entries.values()):
                 raise RuntimeError('draft owner is no longer retained')
+            if owner.active or self._pins.get(id(owner), 0):
+                raise RuntimeError('draft owner already has an exclusive lease')
             self._pins[id(owner)] = self._pins.get(id(owner), 0) + 1
         try:
             yield
