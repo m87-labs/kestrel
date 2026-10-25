@@ -377,3 +377,50 @@ def verification_weight_loading_callbacks(runtime):
                 model, program.descriptor, runtime._verification_weight_storage, layer_prefix=prefix)
 
     return prepare, finalize
+
+
+def validate_verification_capabilities(runtime, target_config):
+    """Reject missing selected backend APIs before constructing/loading weights.
+
+    This validates Python runtime capabilities, not cubin geometry or numerical
+    qualification. Retained-prefix KernelDemand remains a separate requirement.
+    """
+    from importlib import import_module
+    from types import SimpleNamespace
+
+    path = runtime._cfg.verification_path
+    if path == "auto":
+        path = runtime.decode_path
+    if path == "native":
+        return
+    from .dflash import DFlashConfig
+    draft = DFlashConfig.from_dict(json.loads(
+        (Path(runtime._draft_model_path) / "config.json").read_text()))
+    probe = SimpleNamespace(
+        max_batch_size=runtime.max_batch_size, page_size=runtime._cfg.page_size,
+        device=runtime.device, _cfg=runtime._cfg,
+        model=SimpleNamespace(model=SimpleNamespace(
+            language_model=SimpleNamespace(config=target_config))))
+    if path == "auto" and not Qwen35GeneratedVerification.supports(
+            probe, SimpleNamespace(config=draft)):
+        return
+    required = [("verification_pointwise", "stage_candidate")]
+    if torch.cuda.get_device_capability(runtime.device) == (9, 0):
+        required.append(("generated_verification_segments", "SegmentedVerification"))
+        if runtime._cfg.enable_cuda_graphs and not draft.selector_rank:
+            required.append(("argmax_confidence", "argmax_with_confidence"))
+    missing = []
+    for module, symbol in required:
+        qualified = f"kestrel_kernels.{module}.{symbol}"
+        try:
+            capability = getattr(import_module(f"kestrel_kernels.{module}"), symbol)
+            if not callable(capability):
+                raise TypeError("capability is not callable")
+        except (ImportError, AttributeError, OSError, TypeError) as error:
+            missing.append(f"{qualified}: {error}")
+    if missing:
+        raise RuntimeError(
+            "Selected generated Qwen verification requires missing native runtime capabilities: "
+            + "; ".join(missing)
+            + ". Install a compatible kestrel-kernels build with CuTe DSL implementations; "
+            "backend fallback is disabled.")
