@@ -600,7 +600,8 @@ class Qwen35DFlashDecoder:
             gdn_state_indices=state_indices,
             gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
         features = torch.cat(output.layer_hidden_states, dim=-1).split(lengths, dim=1)
-        expected = predictions[0].split(lengths)
+        if predictions.shape != (1, sum(lengths)):
+            raise ValueError("packed verification predictions do not match sequence lengths")
         if packed._borrowed_recurrent_state:
             for branch in branches:
                 branch._borrowed_recurrent_state = True
@@ -620,7 +621,15 @@ class Qwen35DFlashDecoder:
                     branch._prefix_records[index] = replace(records[row], state_indices=local_state_indices[row:row + 1])
         for branch, session, length in zip(branches, sessions, lengths):
             branch.advance_to(session.cache.seq_length + length)
-        return [(tokens.tolist(), feature, branch)
+        # Keep the host transfer after branch setup so that work can overlap
+        # verification. Transfer once instead of one copy/sync per sequence.
+        flat_expected = predictions[0].tolist()
+        expected = []
+        offset = 0
+        for length in lengths:
+            expected.append(flat_expected[offset:offset + length])
+            offset += length
+        return [(tokens, feature, branch)
                 for tokens, feature, branch in zip(expected, features, branches)]
 
     def commit_accept(self, ctx):

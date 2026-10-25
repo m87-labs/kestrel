@@ -426,7 +426,22 @@ def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(mon
         return SimpleNamespace(last_hidden_state=hidden, layer_hidden_states=(hidden,))
 
     obj.text = text
+    transfers = []
+
+    class Predictions(torch.Tensor):
+        def tolist(self):
+            transfers.append(self.numel())
+            return super().tolist()
+
+    original_verify = obj._verify
+
+    def verify(*args, **kwargs):
+        output, predictions = original_verify(*args, **kwargs)
+        return output, predictions.as_subclass(Predictions)
+
+    obj._verify = verify
     results = Qwen35DFlashDecoder._target_many(obj, [[2, 3], [4, 5, 6]], sessions)
+    assert transfers == [5], "packed predictions must cross the host boundary once"
     for row, (result, session, count) in enumerate(zip(results, sessions, (2, 3))):
         expected, features, branch = result
         slot = session.state.batch_idx
@@ -832,3 +847,62 @@ def test_native_prefix_cap_cannot_exceed_loaded_draft_block(monkeypatch):
     monkeypatch.setattr(module, 'load_dflash_drafter', lambda *args, **kwargs: draft)
     with pytest.raises(ValueError, match='fit the draft block'):
         module.Qwen35DFlashDecoder(runtime, 'draft')
+
+
+@pytest.mark.parametrize("count", [1, 2, 4, 8, 17])
+@pytest.mark.parametrize("extra_predictions", [-1, 0, 1])
+def test_packed_predictions_transfer_once_for_ragged_reordered_cohorts(monkeypatch, count, extra_predictions):
+    import kestrel.models.qwen35.spec_decoder as module
+    from kestrel.models.qwen35.cache import Qwen35InferenceCache
+
+    obj, _, _, _ = decoder()
+    obj.runtime.device = torch.device("cpu")
+    obj.runtime.max_batch_size = count
+    obj.runtime.page_size = 4
+    obj.runtime.page_table.page_table = torch.arange((2 * count + 1) * 16).reshape(2 * count + 1, 16)
+    obj.draft = SimpleNamespace(config=SimpleNamespace(target_layer_ids=(0,)))
+    sessions = []
+    candidates = []
+    for row in range(count):
+        cache = Qwen35InferenceCache(config=SimpleNamespace(layer_types=()), paged_kv=())
+        cache.seq_length = row + 1
+        sessions.append(SimpleNamespace(cache=cache, state=SimpleNamespace(batch_idx=2 * (count - row))))
+        candidates.append([100 * row + column for column in range(1 + row % 8)])
+    lengths = tuple(map(len, candidates))
+    cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
+    monkeypatch.setattr(module, "get_runtime", lambda: SimpleNamespace(gated_delta=SimpleNamespace(
+        bind_packed_prefill_topology=lambda **kwargs: (cu, object()))))
+    transfers = []
+
+    class Predictions(torch.Tensor):
+        def tolist(self):
+            transfers.append(self.numel())
+            return super().tolist()
+
+    def verify(*args, **kwargs):
+        ids = kwargs["input_ids"]
+        hidden = ids[..., None].float()
+        predictions = ids + 1000
+        if extra_predictions < 0:
+            predictions = predictions[:, :-1]
+        elif extra_predictions > 0:
+            predictions = torch.cat((predictions, predictions[:, -1:]), dim=1)
+        return SimpleNamespace(layer_hidden_states=(hidden,)), predictions.as_subclass(Predictions)
+
+    obj._verify = verify
+    if extra_predictions:
+        with pytest.raises(ValueError, match="predictions do not match"):
+            Qwen35DFlashDecoder._target_many(obj, candidates, sessions)
+        assert not transfers
+        return
+    results = Qwen35DFlashDecoder._target_many(obj, candidates, sessions)
+    assert transfers == [sum(lengths)]
+    for tokens, (expected, features, branch), session in zip(candidates, results, sessions):
+        assert expected == [token + 1000 for token in tokens]
+        assert features.flatten().tolist() == tokens
+        assert branch._prefix_source is session.cache
+        assert branch.seq_length == session.cache.seq_length + len(tokens)
+    # CPU lists are detached results: one row cannot mutate its neighbor.
+    if count > 1:
+        results[0][0].append(-1)
+        assert results[1][0] == [token + 1000 for token in candidates[1]]
