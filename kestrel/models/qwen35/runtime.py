@@ -512,6 +512,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             prepare_generated_weight_storage_for_loading,
         )
         from .generated_decode import _WEIGHT_LAYER_PREFIX
+        from .generated_verification import validate_fp8_projection_coverage
 
         def prepare_model(model: nn.Module) -> None:
             self._generated_weight_storage = (
@@ -545,6 +546,7 @@ class Qwen35Runtime(UncachedPagedRuntime):
             device=self.device,
             dtype=self.dtype,
             revision=self._spec.revision,
+            validate_config=lambda config: validate_fp8_projection_coverage(self, config.text_config),
             prepare_model=prepare_model,
             finalize_model=finalize_model,
         )
