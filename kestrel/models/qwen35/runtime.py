@@ -498,11 +498,13 @@ class Qwen35Runtime(UncachedPagedRuntime):
         from .qwen_loader import load_qwen35_model
 
         if self._draft_model_path is not None:
-            from .generated_verification import verification_weight_loading_callbacks
+            from .generated_verification import (
+                verification_weight_loading_callbacks, validate_verification_capabilities)
 
             prepare, finalize = verification_weight_loading_callbacks(self)
             return load_qwen35_model(
                 source, device=self.device, dtype=self.dtype, revision=self._spec.revision,
+                validate_config=lambda config: validate_verification_capabilities(self, config.text_config),
                 prepare_model=prepare, finalize_model=finalize)
 
         from kestrel.runtime.generated_decode import (

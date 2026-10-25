@@ -814,6 +814,7 @@ def load_qwen35_model(
     device: torch.device,
     dtype: torch.dtype,
     revision: str | None = None,
+    validate_config: Callable[[Qwen3_5Config], None] | None = None,
     prepare_model: Callable[[torch.nn.Module], None] | None = None,
     finalize_model: Callable[[torch.nn.Module], None] | None = None,
 ) -> Qwen3_5ForConditionalGeneration:
@@ -823,6 +824,8 @@ def load_qwen35_model(
     with open(config_path, "r", encoding="utf-8") as handle:
         config_data: dict[str, Any] = json.load(handle)
     config = Qwen3_5Config.from_dict(config_data)
+    if validate_config is not None:
+        validate_config(config)
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
