@@ -84,7 +84,7 @@ def test_target_taps_pass_through_multimodal_model(monkeypatch):
 
 def _metadata():
     return {
-        "hidden_size": 128, "intermediate_size": 256,
+        "hidden_size": 128, "intermediate_size": 512,
         "num_hidden_layers": 6, "num_attention_heads": 4,
         "num_key_value_heads": 1, "head_dim": 128,
         "rms_norm_eps": 1e-6, "hidden_act": "silu", "attention_bias": False,
@@ -285,3 +285,52 @@ def test_checkpoint_projection_packing_preserves_values_and_storage(tmp_path):
         torch.testing.assert_close(value, after.self_attn.v_proj(hidden))
         assert not any(name in ("gate_proj.weight", "up_proj.weight") for name, _ in after.mlp.named_parameters())
         assert not any(name in ("k_proj.weight", "v_proj.weight") for name, _ in after.self_attn.named_parameters())
+
+
+def test_draft_mlp_propagates_missing_native_activation(monkeypatch):
+    from types import SimpleNamespace
+    from kestrel.models.qwen35 import dflash
+
+    model = dflash._MLP(SimpleNamespace(hidden_size=16, intermediate_size=32))
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("native activation artifact missing")
+    monkeypatch.setattr(dflash, "get_runtime", lambda device: SimpleNamespace(
+        dense=SimpleNamespace(gated_activation_into=unavailable)))
+    def forbidden(*args, **kwargs):
+        pytest.fail("down projection ran after activation failure")
+    monkeypatch.setattr(model.down_proj, "forward", forbidden)
+    with pytest.raises(RuntimeError, match="native activation artifact missing"):
+        model(torch.ones(1, 2, 16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch", [1, 2, 4, 8])
+def test_draft_mlp_native_activation_matches_fused_reference(batch, monkeypatch):
+    from types import SimpleNamespace
+    from kestrel.models.qwen35.dflash import _MLP
+    import kestrel_kernels.swiglu.dispatch as dispatch
+
+    torch.manual_seed(570)
+    model = _MLP(SimpleNamespace(hidden_size=5120, intermediate_size=17408)).cuda().bfloat16()
+    hidden = torch.randn(batch, 8, 5120, device="cuda", dtype=torch.bfloat16) * .2
+    monkeypatch.setattr(dispatch, "gated_activation_torch",
+                        lambda *a, **k: pytest.fail("CUDA activation fell back"))
+    def reference():
+        gate, up = model.gate_up_proj(hidden).float().chunk(2, -1)
+        return model.down_proj((torch.nn.functional.silu(gate) * up).bfloat16())
+    expected = reference()
+    torch.testing.assert_close(model(hidden), expected, rtol=.02, atol=.002)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3): model(hidden)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = model(hidden)
+    hidden.neg_()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph.replay()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.testing.assert_close(output, reference(), rtol=.02, atol=.002)

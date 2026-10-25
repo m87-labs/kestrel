@@ -251,8 +251,11 @@ class _MLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden):
-        gate, up = self.gate_up_proj(hidden).chunk(2, dim=-1)
-        return self.down_proj(torch.nn.functional.silu(gate) * up)
+        gate_up = self.gate_up_proj(hidden)
+        activated = gate_up.new_empty(*gate_up.shape[:-1], gate_up.shape[-1] // 2)
+        get_runtime(gate_up.device).dense.gated_activation_into(
+            activated, gate_up, activation="silu", layout="contiguous")
+        return self.down_proj(activated)
 
 
 class _DynamicConv(nn.Module):

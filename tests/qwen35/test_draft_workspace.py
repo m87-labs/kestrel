@@ -137,7 +137,7 @@ def test_stable_attention_layer_matches_eager_sessions(sliding):
 def _session_fixture(capacity=64):
     from kestrel.models.qwen35.dflash import (
         DFlashConfig, DFlashDraftModel, DFlashContextCache, _LayerContextBuffer)
-    config = DFlashConfig(128, 256, 1, 4, 1, 128, 1e-6, 10000, 16, 0,
+    config = DFlashConfig(128, 512, 1, 4, 1, 128, 1e-6, 10000, 16, 0,
                          (0,), ("full_attention",), None)
     model = DFlashDraftModel(config).cuda().bfloat16().requires_grad_(False)
     caches = []
