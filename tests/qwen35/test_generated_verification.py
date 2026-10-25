@@ -19,7 +19,10 @@ def _verification_runtime(*, capacity=1, page_size=1, weight_format="fp8_e4m3"):
                              dense_weight_format=weight_format)
     return SimpleNamespace(
         max_batch_size=capacity, page_size=page_size, device=torch.device("cuda"),
-        dtype=torch.bfloat16, decode_path="auto", _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path="auto"),
+        dtype=torch.bfloat16, decode_path="auto",
+        _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path="auto",
+            draft_graph_cache_entries=RuntimeConfig.__dataclass_fields__["draft_graph_cache_entries"].default,
+            draft_graph_known_tensor_bytes=RuntimeConfig.__dataclass_fields__["draft_graph_known_tensor_bytes"].default),
         model=SimpleNamespace(model=SimpleNamespace(language_model=SimpleNamespace(config=target))))
 
 

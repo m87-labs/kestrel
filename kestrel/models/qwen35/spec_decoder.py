@@ -545,9 +545,9 @@ class Qwen35DFlashDecoder:
             width = (self._generated_verifiers[count].block
                      if self._generated_verification is not None else config.block_size)
         if (tokens.ndim != 2 or tokens.shape[0] != count
-                or tokens.shape[1] < width - 1 or tokens.dtype != torch.long):
-            raise ValueError("draft proposals require complete int64 token rows")
-        anchors = tokens.new_tensor([[session.bonus] for session in sessions])
+                or tokens.shape[1] < width - 1 or tokens.dtype not in (torch.int32, torch.int64)):
+            raise ValueError("draft proposals require complete integer token rows")
+        anchors = tokens.new_tensor([[session.bonus] for session in sessions], dtype=torch.long)
         # Verification can consume these IDs before acceptance reads them on
         # the host. The new allocation also detaches them from draft graph I/O.
         return torch.cat((anchors, tokens[:, :width - 1]), dim=1)
@@ -725,7 +725,7 @@ class Qwen35DFlashDecoder:
                         session.state.batch_idx, capture=True, leases=leases)]
                     candidates = [candidate.tolist()]
                 else:
-                    candidate = torch.cat((proposed.new_tensor([session.bonus]), proposed))
+                    candidate = torch.cat((proposed.new_tensor([session.bonus], dtype=torch.long), proposed))
                     results = [self._target(candidate, session.cache,
                         session.state.batch_idx, capture=True, leases=leases)]
                     candidates = [candidate.tolist()]

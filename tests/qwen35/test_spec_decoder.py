@@ -974,7 +974,8 @@ def test_single_target_direct_staging_preserves_committed_owner(monkeypatch, cap
 @pytest.mark.parametrize('warmed', [False, True])
 @pytest.mark.parametrize('fail_commit', [False, True])
 @pytest.mark.parametrize('count', [2, 4, 8, 17])
-def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit, count):
+@pytest.mark.parametrize('token_dtype', [torch.int32, torch.int64])
+def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit, count, token_dtype):
     from contextlib import contextmanager
     events = []
     obj, _, _, _ = decoder()
@@ -992,7 +993,7 @@ def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit,
     @contextmanager
     def launch(*args, **kwargs):
         # The sole strong output reference is transferred through the lease.
-        yield torch.arange(count*3).reshape(count,3).as_subclass(Tokens)
+        yield torch.arange(count*3, dtype=token_dtype).reshape(count,3).as_subclass(Tokens)
         events.append('context_queued')
         if fail_commit:
             raise RuntimeError('context copy failed')
@@ -1016,6 +1017,7 @@ def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit,
     else:
         result = Qwen35DFlashDecoder._propose_many(obj, sessions)
         assert isinstance(result, torch.Tensor)
+        assert result.dtype == torch.long
         assert 'host_transfer' not in events
         assert result.tolist() == [[row, 3*row, 3*row+1, 3*row+2] for row in range(count)]
         assert events.index('context_queued') < events.index('host_transfer')
@@ -1025,7 +1027,8 @@ def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit,
 
 @pytest.mark.parametrize('count', [1, 2, 4, 8, 17])
 @pytest.mark.parametrize('width', [None, 2])
-def test_native_step_reads_candidates_only_after_verification(count, width):
+@pytest.mark.parametrize('token_dtype', [torch.int32, torch.int64])
+def test_native_step_reads_candidates_only_after_verification(count, width, token_dtype):
     obj, first, _, _ = decoder()
     states = [first] + [add_session(obj, slot=row + 3) for row in range(count - 1)]
     obj._native_verification_width = width
@@ -1038,7 +1041,7 @@ def test_native_step_reads_candidates_only_after_verification(count, width):
             reads.append(self.numel())
             return super().tolist()
 
-    obj.propose = lambda session: DraftResult(torch.tensor([[8, 9, 10]]).as_subclass(Candidates))
+    obj.propose = lambda session: DraftResult(torch.tensor([[8, 9, 10]], dtype=token_dtype).as_subclass(Candidates))
     obj._propose_many = lambda sessions: torch.tensor([
         [session.bonus, 8, 9, 10] for session in sessions]).as_subclass(Candidates)
     target = obj._target
