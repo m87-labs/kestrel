@@ -60,6 +60,10 @@ class Qwen35DFlashDecoder:
         self._target_graph = None
         self._replay_graph = None
         self._draft_graph = None
+        from .draft_owner_cache import DraftOwnerCache
+        self._draft_owners = DraftOwnerCache(
+            max_entries=runtime._cfg.draft_graph_cache_entries,
+            known_tensor_bytes=runtime._cfg.draft_graph_known_tensor_bytes)
         self._draft_graph_enabled = runtime._cfg.enable_cuda_graphs
         self._graph_failed = False
         self._closed = False
@@ -165,8 +169,8 @@ class Qwen35DFlashDecoder:
                     self._replay_graph.shutdown()
             finally:
                 try:
-                    if self._draft_graph is not None:
-                        self._draft_graph.shutdown()
+                    self._draft_owners.shutdown()
+                    self._draft_graph = None
                 finally:
                     if self._native_projections is not None:
                         self._native_projections.close()
@@ -387,21 +391,46 @@ class Qwen35DFlashDecoder:
                                                 confidence=confidence)
             return
         from .draft_workspace import DFlashDraftGraphSession
-        if (self._draft_graph is None or len(self._draft_graph.caches) != len(caches)
-                or self._draft_graph.proposal_count != proposal_count
-                or any(cache.capacity > self._draft_graph.workspaces[0].capacity
-                       for cache in caches)):
-            if self._draft_graph is not None:
-                self._draft_graph.shutdown()
-                self._draft_graph = None
-            self._draft_graph = DFlashDraftGraphSession(
+        parameter = next(self.draft.parameters())
+        confidence_key = None if confidence is None else (
+            id(confidence), tuple(confidence.shape), tuple(confidence.stride()),
+            confidence.dtype, confidence.device)
+        key = (len(caches), proposal_count, max(cache.capacity for cache in caches),
+               parameter.device, parameter.dtype, self.draft.config.block_size, confidence_key)
+        reservation = DFlashDraftGraphSession.known_tensor_reservation(
+            self.draft, caches, proposal_count, projected=self.runtime.model.lm_head is not None)
+        previous_owner = self._draft_graph
+        self._draft_graph = None
+        with self._draft_owners.lease(key, reservation, lambda: DFlashDraftGraphSession(
                 self.draft, caches, lm_head=self.runtime.model.lm_head,
-                confidence=confidence, proposal_count=proposal_count)
-        elif (any(left is not right for left, right in zip(self._draft_graph.caches, caches))
-              or self._draft_graph.lengths != tuple(cache.length for cache in caches)):
-            self._draft_graph.rebind(caches)
-        with self._draft_graph.launch(noise, features, positions, anchors) as tokens:
-            yield tokens
+                confidence=confidence, proposal_count=proposal_count),
+                compatible=lambda candidate: (candidate[:2] == key[:2]
+                    and candidate[3:] == key[3:] and candidate[2] >= key[2])) as owner:
+            if (owner is not previous_owner
+                    or any(left is not right for left, right in zip(owner.caches, caches))
+                    or owner.lengths != tuple(cache.length for cache in caches)):
+                try:
+                    owner.rebind(caches)
+                except BaseException:
+                    owner.failed = True
+                    raise
+            self._draft_graph = owner
+            try:
+                with owner.launch(noise, features, positions, anchors) as tokens:
+                    self._draft_owners.validate_retained_bytes(owner)
+                    yield tokens
+            finally:
+                if owner.failed or owner.closed:
+                    self._draft_graph = None
+
+    @contextmanager
+    def _pin_draft_owner(self, owner):
+        try:
+            with self._draft_owners.pin(owner):
+                yield
+        finally:
+            if owner.failed or owner.closed:
+                self._draft_graph = None
 
     def propose(self, ctx):
         if self._width_policy is None:
@@ -429,12 +458,12 @@ class Qwen35DFlashDecoder:
         config = self.draft.config
         start = ctx.cache.seq_length
         session = self._draft_graph
-        if (session is not None and len(session.caches) == 1
+        if (session is not None and not session.closed and not session.failed and len(session.caches) == 1
                 and session.caches[0] is ctx.draft_cache
                 and session.lengths == (ctx.draft_cache.length,)
                 and ctx.features.shape[1] <= session.context_rows
                 and session.graph.has_staged_entry):
-            with session.launch_tokens(ctx.features, self.text.embed_tokens.weight,
+            with self._pin_draft_owner(session), session.launch_tokens(ctx.features, self.text.embed_tokens.weight,
                                        bonus=ctx.bonus, target_position=start) as ids:
                 pass
             return DraftResult(token_ids=ids)
@@ -456,7 +485,7 @@ class Qwen35DFlashDecoder:
         count = len(sessions)
         policy = getattr(self, "_batch_width_policies", {}).get(count)
         graph = self._draft_graph
-        warmed = (graph is not None and len(graph.caches) == count
+        warmed = (graph is not None and not graph.closed and not graph.failed and len(graph.caches) == count
                   and graph.graph.has_staged_entry
                   and all(left is right.draft_cache for left, right in zip(graph.caches, sessions))
                   and graph.lengths == tuple(session.draft_cache.length for session in sessions)
@@ -466,7 +495,7 @@ class Qwen35DFlashDecoder:
             begin, end = self._draft_timing_events
             begin.record()
         if warmed:
-            with graph.launch_tokens_many(
+            with self._pin_draft_owner(graph), graph.launch_tokens_many(
                     [session.features for session in sessions], self.text.embed_tokens.weight,
                     bonuses=[session.bonus for session in sessions],
                     target_positions=[session.cache.seq_length for session in sessions]) as tokens:
@@ -739,6 +768,7 @@ class Qwen35DFlashDecoder:
             raise ValueError("cannot retire a different speculative sequence")
         if self._commit_pending:
             self._commit_ready.synchronize()
+        self._draft_owners.detach_cache_owner(session.draft_cache)
         self.runtime.page_table.erase(state.batch_idx)
         # Scheduler cleanup still uses batch_idx to remove active_sequences.
         del self._sessions[state.batch_idx]

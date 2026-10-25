@@ -179,6 +179,10 @@ class RuntimeConfig:
     # configured batch domain and may not fall back to native decode.
     decode_path: DecodePath = "auto"
     draft_model_path: str | Path | None = None
+    # Retained draft owners: known KV/input/output tensors only, excluding
+    # private CUDA graph intermediates, native scratch and library workspaces.
+    draft_graph_cache_entries: int = 4
+    draft_graph_known_tensor_bytes: int = 4 * 1024**3
     # Requests per forward for single-pass runtimes (Parakeet). ``None`` lets
     # the runtime choose by device: 128 on CUDA devices of 40 GiB or more, 64
     # on smaller ones, 8 on CPU and MPS.
@@ -201,6 +205,9 @@ class RuntimeConfig:
     verification_attention_implementation: str = "simt"
 
     def __post_init__(self):
+        if any(type(v) is not int or v <= 0 for v in
+               (self.draft_graph_cache_entries, self.draft_graph_known_tensor_bytes)):
+            raise ValueError("draft graph cache bounds must be positive integers")
         if self.verification_path not in ("auto", "native", "generated"):
             raise ValueError("verification_path must be auto, native, or generated")
         if self.verification_projection_path not in ("canonical", "default"):

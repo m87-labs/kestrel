@@ -353,6 +353,8 @@ def test_decoder_reuses_fitting_draft_workspace_and_grows_for_larger_owner():
     owner = SimpleNamespace(_draft_graph_enabled=True, _draft_graph=None, draft=model,
                             _generated_verification=None,
                             runtime=SimpleNamespace(model=SimpleNamespace(lm_head=None)))
+    from kestrel.models.qwen35.draft_owner_cache import DraftOwnerCache
+    owner._draft_owners = DraftOwnerCache(max_entries=1, known_tensor_bytes=4*1024**2)
     sessions = []
     try:
         for capacity in (64, 32, 128):
@@ -368,8 +370,7 @@ def test_decoder_reuses_fitting_draft_workspace_and_grows_for_larger_owner():
         assert sessions[1].closed
         assert sessions[2].workspaces[0].capacity == 128
     finally:
-        if owner._draft_graph is not None:
-            owner._draft_graph.shutdown()
+        owner._draft_owners.shutdown()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
@@ -535,3 +536,61 @@ def test_strided_cache_rejected_before_workspace_mutation(monkeypatch, operation
             assert session.caches == (old_cache,)
             assert session.lengths == (1,)
             assert session._context_copy_plan is original_plan
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+def test_retained_draft_cohorts_replay_with_changed_equal_length_contexts(monkeypatch):
+    from types import SimpleNamespace
+    from kestrel.models.qwen35.dflash import DFlashContextCache, _LayerContextBuffer
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    from kestrel.models.qwen35.draft_owner_cache import DraftOwnerCache
+    from kestrel.models.qwen35.spec_decoder import Qwen35DFlashDecoder
+    from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
+    model, _ = _session_fixture()
+    cfg=model.config
+    captures={}
+    original=FixedShapeSinglePassGraph._capture
+    def capture(graph, inputs):
+        captures[graph]=captures.get(graph,0)+1
+        return original(graph,inputs)
+    monkeypatch.setattr(FixedShapeSinglePassGraph,'_capture',capture)
+    owner=SimpleNamespace(_draft_graph_enabled=True,_draft_graph=None,draft=model,
+        _generated_verification=None,runtime=SimpleNamespace(model=SimpleNamespace(lm_head=None)),
+        _draft_owners=DraftOwnerCache(max_entries=4,known_tensor_bytes=4*1024**3))
+    caches=[]
+    for i in range(8):
+        c=DFlashContextCache(64); c.length=3
+        c.layers=[_LayerContextBuffer(torch.zeros(1,64,cfg.num_key_value_heads,cfg.head_dim,
+            device='cuda',dtype=torch.bfloat16),torch.zeros(1,64,cfg.num_key_value_heads,cfg.head_dim,
+            device='cuda',dtype=torch.bfloat16)) for _ in model.layers]
+        caches.append(c)
+    retained={}
+    try:
+        for iteration,count in enumerate((1,2,4,8,1)):
+            # Same owner IDs and lengths, different source contents after a
+            # different cohort has been used. Rebind must refresh these bytes.
+            for c in caches[:count]:
+                for layer in c.layers:
+                    layer.keys.fill_(iteration*.125); layer.values.fill_(iteration*.25)
+            noise=[torch.ones(1,cfg.block_size,cfg.hidden_size,device='cuda',dtype=torch.bfloat16) for _ in range(count)]
+            features=[torch.zeros(1,0,len(cfg.target_layer_ids)*cfg.hidden_size,device='cuda',dtype=torch.bfloat16) for _ in range(count)]
+            positions=[torch.arange(c.length,c.length+cfg.block_size,device='cuda')[None] for c in caches[:count]]
+            fresh=DFlashDraftGraphSession(model,caches[:count])
+            try:
+                with fresh.launch(noise,features,positions) as result: expected=result.clone()
+            finally:
+                fresh.shutdown()
+            with Qwen35DFlashDecoder._draft_tokens(owner,noise,features,positions,caches[:count]) as result:
+                torch.testing.assert_close(result,expected,rtol=0,atol=0)
+            current=owner._draft_graph
+            if count in retained: assert current is retained[count]
+            retained[count]=current
+            assert captures[current.graph]==1
+            assert current.known_owned_tensor_bytes() <= DFlashDraftGraphSession.known_tensor_reservation(
+                model,caches[:count],cfg.block_size-1,projected=False)
+        owner._draft_owners.detach_cache_owner(caches[0])
+        assert all(not session.caches for session in retained.values())
+        assert all(not session.closed for session in retained.values())
+    finally:
+        owner._draft_owners.shutdown()
+    assert all(session.closed for session in retained.values())

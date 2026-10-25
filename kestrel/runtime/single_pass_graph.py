@@ -262,6 +262,12 @@ class FixedShapeSinglePassGraph:
             finally:
                 self._active_lease_thread = None
 
+    def retained_io_tensors(self):
+        """Snapshot owned static inputs/outputs; excludes graph-private intermediates."""
+        with self._lock:
+            return tuple(t for entry in self._entries.values()
+                         for t in (*entry.inputs, *entry.outputs))
+
     @property
     def has_staged_entry(self) -> bool:
         """Whether exactly one captured shape is available for direct staging."""

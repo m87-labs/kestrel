@@ -79,7 +79,43 @@ class DFlashDraftGraphSession:
     A failed launch/consumer poisons the session rather than attempting rollback.
     """
 
+    @staticmethod
+    def known_tensor_reservation(model, caches, proposal_count, *, projected=True):
+        """Bound explicit owner tensors and one fixed graph input/output set.
+
+        Excludes borrowed model/cache/confidence storage, native plan scratch,
+        CUDA graph internal intermediates and library workspaces.
+        """
+        config = model.config
+        parameter = next(model.parameters())
+        c, b, h = len(caches), config.block_size, config.hidden_size
+        e = parameter.element_size()
+        capacity = max(cache.capacity for cache in caches)
+        kv = len(model.layers) * (2*c*(capacity+b)*config.num_key_value_heads*config.head_dim*e + 4)
+        targets = c*b*len(config.target_layer_ids)*h*e
+        positions = c*2*b*8
+        # Owner targets/positions plus captured hidden/targets/positions,
+        # mapping(int64), used(int32), anchors(int64), result token IDs(int64).
+        output = c*proposal_count*8 if projected else c*b*h*e
+        return kv + 2*targets + 2*positions + c*b*h*e + c*2*b*8 + c*4 + c*8 + output
+
     def __init__(self, model, caches, *, lm_head=None, confidence=None, proposal_count=None):
+        try:
+            self._initialize(model, caches, lm_head=lm_head, confidence=confidence,
+                             proposal_count=proposal_count)
+        except BaseException:
+            # Construction may have queued copies before a native plan fails.
+            if hasattr(self, '_construction_stream'):
+                self._construction_stream.synchronize()
+            if hasattr(self, 'stream'):
+                self.stream.synchronize()
+            if hasattr(self, 'graph'):
+                self.graph.shutdown()
+            if hasattr(self, 'workspaces'):
+                self.workspaces.clear()
+            raise
+
+    def _initialize(self, model, caches, *, lm_head=None, confidence=None, proposal_count=None):
         from kestrel.runtime.single_pass_graph import FixedShapeSinglePassGraph
 
         self.model = model
@@ -121,6 +157,7 @@ class DFlashDraftGraphSession:
                         raise ValueError("draft context copy requires contiguous cache storage; "
                                          f"shape={tuple(tensor.shape)}, stride={tensor.stride()}; "
                                          "PyTorch fallback is disabled")
+        self._construction_stream = torch.cuda.current_stream(parameter.device)
         for index in range(len(model.layers)):
             workspace = DraftLayerKVWorkspace(
                 slots=len(self.caches), capacity=capacity, context_rows=self.context_rows,
@@ -141,6 +178,13 @@ class DFlashDraftGraphSession:
         self._context_copy_plan = self._bind_context_copy_plan()
         self._staging_launch_plan = None
         self._staging_implementation = None
+
+    def known_owned_tensor_bytes(self):
+        tensors = [self.targets, self.positions, *self.graph.retained_io_tensors()]
+        tensors.extend(t for w in self.workspaces for t in (w.keys, w.values, w.scale))
+        storages = {(t.device, t.untyped_storage().data_ptr()): t.untyped_storage().nbytes()
+                    for t in tensors if t is not None}
+        return sum(storages.values())
 
     def _bind_context_copy_plan(self):
         """Retain independent cache destinations while this owner cohort lives."""
@@ -184,7 +228,7 @@ class DFlashDraftGraphSession:
         if self.failed or self.closed or self.active:
             raise RuntimeError("cannot rebind an active, failed, or retired draft graph")
         caches = tuple(caches)
-        if (len(caches) != len(self.caches) or len({id(cache) for cache in caches}) != len(caches)
+        if (len(caches) != self.workspaces[0].keys.shape[0] or len({id(cache) for cache in caches}) != len(caches)
                 or any(cache.capacity > self.workspaces[0].capacity for cache in caches)):
             raise ValueError("draft graph rebind exceeds retained slot capacity")
         for cache in caches:
@@ -408,12 +452,31 @@ class DFlashDraftGraphSession:
         finally:
             self.active = False
 
+    def release_bindings(self):
+        """Drop borrowed request caches after queued context copies complete.
+
+        Retained graph buffers are overwritten by launch/rebind before reuse.
+        No request KV tensor or native destination plan remains referenced.
+        """
+        if self.active:
+            raise RuntimeError('cannot detach an active draft graph')
+        self.stream.synchronize()
+        self.caches = ()
+        self.lengths = ()
+        self._context_copy_plan = None
+        self._staging_launch_plan = None
+        self._staging_implementation = None
+
     def shutdown(self):
         if self.active:
             raise RuntimeError("cannot retire an active draft graph lease")
+        if self.closed:
+            return
         self.closed = True
         self.graph.shutdown()
         self._context_copy_plan = None
+        self._staging_launch_plan = None
+        self._staging_implementation = None
         # A caller can still hold this retired session while constructing its
         # replacement. Release synchronized storage now to avoid overlapping
         # two full draft KV workspaces during a batch geometry change.
