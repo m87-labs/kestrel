@@ -969,3 +969,55 @@ def test_single_target_direct_staging_preserves_committed_owner(monkeypatch, cap
     assert source.seq_length == 3
     assert torch.all(source.layers[0].recurrent_states == 1)
     assert torch.all(source.layers[0].conv_states == 1)
+
+
+@pytest.mark.parametrize('warmed', [False, True])
+@pytest.mark.parametrize('fail_commit', [False, True])
+@pytest.mark.parametrize('count', [2, 4, 8, 17])
+def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit, count):
+    from contextlib import contextmanager
+    events = []
+    obj, _, _, _ = decoder()
+    obj.runtime.device = torch.device('cpu')
+    obj.draft = SimpleNamespace(config=SimpleNamespace(block_size=4, mask_token_id=0))
+    obj.text = SimpleNamespace(embed_tokens=torch.nn.Embedding(32, 2))
+    sessions = [SimpleNamespace(draft_cache=SimpleNamespace(length=row),
+        cache=SimpleNamespace(seq_length=row+1), features=torch.ones(1, 1, 2), bonus=row)
+        for row in range(count)]
+    class Tokens(torch.Tensor):
+        def tolist(self):
+            assert 'context_queued' in events
+            if warmed:
+                assert events[-1] == 'context_queued' and 'unpin' not in events
+            events.append('host_transfer')
+            return super().tolist()
+    @contextmanager
+    def launch(*args, **kwargs):
+        # The sole strong output reference is transferred through the lease.
+        yield torch.arange(count*3).reshape(count,3).as_subclass(Tokens)
+        events.append('context_queued')
+        if fail_commit:
+            raise RuntimeError('context copy failed')
+    @contextmanager
+    def pin(owner):
+        events.append('pin')
+        try:
+            yield
+        finally:
+            events.append('unpin')
+    obj._pin_draft_owner = pin
+    obj._draft_tokens = launch
+    if warmed:
+        obj._draft_graph = SimpleNamespace(closed=False, failed=False,
+            caches=[s.draft_cache for s in sessions], lengths=tuple(s.draft_cache.length for s in sessions),
+            graph=SimpleNamespace(has_staged_entry=True), launch_tokens_many=launch)
+    if fail_commit:
+        with pytest.raises(RuntimeError, match='context copy failed'):
+            Qwen35DFlashDecoder._propose_many(obj, sessions)
+        assert 'host_transfer' not in events
+    else:
+        result = Qwen35DFlashDecoder._propose_many(obj, sessions)
+        assert result == [[row, 3*row, 3*row+1, 3*row+2] for row in range(count)]
+        assert events.index('context_queued') < events.index('host_transfer')
+        if warmed:
+            assert events.index('host_transfer') < events.index('unpin')
