@@ -29,6 +29,7 @@ def decoder():
     obj._commit_pending = False
     obj._generated_verification = None
     obj._verification_layouts = {}
+    obj._query_metadata_workspaces = {}
     obj._candidate_buffers = {}
     state = SimpleNamespace(batch_idx=1, max_length=100, length=10)
     erased = []
@@ -385,7 +386,7 @@ def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(mon
         cache.layers[0].conv_states = torch.full((1, 2, 3), float(start))
         cache.layers[0].recurrent_states = torch.full((1, 1, 1, 1), float(session.state.batch_idx))
         session.cache = cache
-    page_table = torch.arange(32).reshape(4, 8)
+    page_table = torch.arange(32, dtype=torch.int32).reshape(4, 8)
     obj.runtime.device = torch.device("cpu")
     obj.runtime.page_size = 4
     obj.runtime.page_table.page_table = page_table
@@ -407,7 +408,9 @@ def test_packed_target_preserves_per_sequence_positions_and_branch_ownership(mon
         assert kwargs["sequence_lengths"] == (2, 3)
         assert kwargs["position_ids"].tolist() == [[7, 8, 13, 14, 15]]
         assert kwargs["paged_kv_seqlens_k"].tolist() == [9, 16]
-        assert kwargs["page_table"].equal(page_table[[3, 1]])
+        for row, (slot, used) in enumerate(((3, 9), (1, 16))):
+            valid = (used + 3) // 4
+            assert kwargs["page_table"][row, :valid].equal(page_table[slot, :valid])
         assert kwargs["seq_idx"].tolist() == [[0, 0, 1, 1, 1]]
         expected_slots = [page_table[3, pos // 4].item() * 4 + pos % 4 for pos in (7, 8)]
         expected_slots += [page_table[1, pos // 4].item() * 4 + pos % 4 for pos in (13, 14, 15)]
@@ -859,7 +862,7 @@ def test_packed_predictions_transfer_once_for_ragged_reordered_cohorts(monkeypat
     obj.runtime.device = torch.device("cpu")
     obj.runtime.max_batch_size = count
     obj.runtime.page_size = 4
-    obj.runtime.page_table.page_table = torch.arange((2 * count + 1) * 16).reshape(2 * count + 1, 16)
+    obj.runtime.page_table.page_table = torch.arange((2 * count + 1) * 16, dtype=torch.int32).reshape(2 * count + 1, 16)
     obj.draft = SimpleNamespace(config=SimpleNamespace(target_layer_ids=(0,)))
     sessions = []
     candidates = []
@@ -918,7 +921,7 @@ def test_single_target_direct_staging_preserves_committed_owner(monkeypatch, cap
     obj, _, _, _ = decoder()
     obj.runtime.device = torch.device("cpu")
     obj.runtime.page_size = 4
-    obj.runtime.page_table.page_table = torch.arange(16).reshape(2, 8)
+    obj.runtime.page_table.page_table = torch.arange(16, dtype=torch.int32).reshape(2, 8)
     obj.draft = SimpleNamespace(config=SimpleNamespace(target_layer_ids=(0,)))
     obj._target_graph = object() if graph else None
     source = Qwen35InferenceCache(config=SimpleNamespace(layer_types=("linear_attention",)), paged_kv=(None,))
@@ -935,6 +938,10 @@ def test_single_target_direct_staging_preserves_committed_owner(monkeypatch, cap
         return original_copy(destinations, sources)
     monkeypatch.setattr(torch, "_foreach_copy_", copy_many)
     direct = capture and leased and graph
+    if not capture:
+        from kestrel.models.qwen35 import query_metadata
+        monkeypatch.setattr(query_metadata, "build_query_metadata",
+                            lambda *args: pytest.fail("admission must not request verification metadata"))
     def verify(leases, **kwargs):
         branch = kwargs['past_key_values']
         assert branch is not source and branch.layers[0] is not source.layers[0]

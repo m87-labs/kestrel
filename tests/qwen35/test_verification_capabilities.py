@@ -32,13 +32,17 @@ def test_selected_generated_reports_all_missing_apis(tmp_path, monkeypatch, arch
     assert ("argmax_with_confidence" in str(error.value)) == ("argmax_with_confidence" in expected)
 
 
-def test_explicit_native_does_not_probe_generated_modules():
+def test_explicit_native_does_not_probe_generated_modules(monkeypatch):
+    from kestrel.models.qwen35 import query_metadata
+    monkeypatch.setattr(query_metadata, "require_query_metadata", lambda device: None)
     module.validate_verification_capabilities(SimpleNamespace(
-        _cfg=SimpleNamespace(verification_path="native")), object())
+        _cfg=SimpleNamespace(verification_path="native"), device=torch.device("cpu")), object())
 
 
 @pytest.mark.parametrize("supported", [False, True])
 def test_automatic_selection_and_callable_contract(tmp_path, monkeypatch, supported):
+    from kestrel.models.qwen35 import query_metadata
+    monkeypatch.setattr(query_metadata, "require_query_metadata", lambda device: None)
     (tmp_path / "config.json").write_text("{}")
     runtime = SimpleNamespace(_cfg=SimpleNamespace(verification_path="auto", page_size=1,
         enable_cuda_graphs=True), decode_path="auto", max_batch_size=1,
@@ -81,6 +85,9 @@ def test_loader_validates_before_model_construction_or_weight_resolution(tmp_pat
 @pytest.mark.parametrize("capacity", [1, 8])
 def test_real_dense_27b_hopper_auto_keeps_native_backend(tmp_path, monkeypatch, capacity):
     from kestrel.models.qwen35.qwen_config import Qwen3_5TextConfig
+    from kestrel.models.qwen35 import query_metadata
+    admitted = []
+    monkeypatch.setattr(query_metadata, "require_query_metadata", lambda device: admitted.append(device))
     from kestrel.models.qwen35.dflash import DFlashConfig
     target = Qwen3_5TextConfig(vocab_size=248320, hidden_size=5120,
         num_hidden_layers=64, intermediate_size=17408, num_attention_heads=24,
@@ -99,6 +106,7 @@ def test_real_dense_27b_hopper_auto_keeps_native_backend(tmp_path, monkeypatch, 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
     monkeypatch.setattr(importlib, "import_module", lambda name: pytest.fail("native27 probed generated API"))
     module.validate_verification_capabilities(runtime, target)
+    assert admitted == [runtime.device]
 
 
 def test_auto_decode_generated_requires_capabilities(tmp_path, monkeypatch):
@@ -113,3 +121,13 @@ def test_auto_decode_generated_requires_capabilities(tmp_path, monkeypatch):
     monkeypatch.setattr(importlib, "import_module", lambda name: SimpleNamespace())
     with pytest.raises(RuntimeError, match="stage_candidate"):
         module.validate_verification_capabilities(runtime, object())
+
+
+def test_native_missing_metadata_stops_configuration(monkeypatch):
+    from kestrel.models.qwen35 import query_metadata
+    def reject(device):
+        raise RuntimeError("missing packed query metadata artifact")
+    monkeypatch.setattr(query_metadata, "require_query_metadata", reject)
+    with pytest.raises(RuntimeError, match="metadata artifact"):
+        module.validate_verification_capabilities(SimpleNamespace(
+            _cfg=SimpleNamespace(verification_path="native"), device=torch.device("cuda")), object())

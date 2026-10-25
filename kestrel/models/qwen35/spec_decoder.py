@@ -57,6 +57,7 @@ class Qwen35DFlashDecoder:
         self.num_lookahead_tokens = config.block_size
         self._sessions = {}
         self._verification_layouts = OrderedDict()
+        self._query_metadata_workspaces = OrderedDict()
         self._target_graph = None
         self._replay_graph = None
         self._draft_graph = None
@@ -163,6 +164,7 @@ class Qwen35DFlashDecoder:
             self._commit_stream.synchronize()
             if self._target_graph is not None:
                 self._target_graph.shutdown()
+            self._query_metadata_workspaces.clear()
         finally:
             try:
                 if self._replay_graph is not None:
@@ -351,19 +353,26 @@ class Qwen35DFlashDecoder:
         device = self.runtime.device
         start, length = committed.seq_length, len(tokens)
         ids = torch.tensor([tokens], device=device, dtype=torch.long)
-        positions = torch.arange(start, start+length, device=device)[None]
-        page_row = self.runtime.page_table.page_table[slot:slot+1]
-        page_size = self.runtime.page_size
-        slots = page_row[0, positions // page_size].long() * page_size + positions % page_size
+        from .query_metadata import build_query_metadata
+        metadata = build_query_metadata(self, (length,), (slot,), (start,)) if capture else None
+        if metadata is None:
+            positions = torch.arange(start, start+length, device=device)[None]
+            page_row = self.runtime.page_table.page_table[slot:slot+1]
+            page_size = self.runtime.page_size
+            slots = page_row[0, positions // page_size].long() * page_size + positions % page_size
+            used = torch.tensor([start+length], device=device, dtype=torch.int32)
+        else:
+            positions, page_row, slots, used = metadata.positions, metadata.pages, metadata.slots, metadata.used
         cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
             sequence_lengths=(length,), device=device)
         output, predictions = self._verify(leases, last_token_only=not capture, verification=capture,
             state_sources=[committed] if graph_staging else None,
             input_ids=ids, past_key_values=cache, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slots, page_table=page_row,
-            paged_kv_seqlens_k=torch.tensor([start+length], device=device, dtype=torch.int32),
+            paged_kv_seqlens_k=used,
             cu_seq_lens_q=cu, sequence_lengths=(length,), topology_token=topology,
-            seq_idx=torch.zeros((1, length), device=device, dtype=torch.int32),
+            seq_idx=(metadata.seq_idx if metadata is not None else
+                     torch.zeros((1, length), device=device, dtype=torch.int32)),
             gdn_state_indices=torch.zeros(1, device=device, dtype=torch.long),
             gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
         cache.advance_to(start+length)
@@ -568,25 +577,19 @@ class Qwen35DFlashDecoder:
         packed, branches = Qwen35InferenceCache.fork_packed_recurrent_state(
             sources, materialize=not graph_staging)
         ids = torch.tensor([sum(candidates, [])], device=device, dtype=torch.long)
-        positions = torch.cat([
-            torch.arange(session.cache.seq_length, session.cache.seq_length + length, device=device)
-            for session, length in zip(sessions, lengths)])[None]
-        slot_ids = torch.tensor([session.state.batch_idx for session in sessions], device=device, dtype=torch.long)
-        page_table = self.runtime.page_table.page_table.index_select(0, slot_ids)
-        page_size = self.runtime.page_size
-        position_rows = positions[0].split(lengths)
-        slot_mapping = torch.cat([
-            page_table[row, position // page_size].long() * page_size + position % page_size
-            for row, position in enumerate(position_rows)])[None]
+        from .query_metadata import build_query_metadata
+        metadata = build_query_metadata(self, lengths,
+            [session.state.batch_idx for session in sessions],
+            [session.cache.seq_length for session in sessions])
+        positions, page_table, slot_mapping, used = (metadata.positions, metadata.pages,
+                                                    metadata.slots, metadata.used)
         layout = self._verification_layouts.get(lengths) if cacheable else None
         if layout is None:
             cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
                 sequence_lengths=lengths, device=device)
             state_indices = torch.arange(len(sessions), device=device, dtype=torch.long)
-            seq_idx = torch.tensor([row for row, length in enumerate(lengths) for _ in range(length)],
-                                   device=device, dtype=torch.int32)[None]
             local_state_indices = torch.zeros_like(state_indices)
-            layout = cu, topology, state_indices, seq_idx, local_state_indices
+            layout = cu, topology, state_indices, local_state_indices
             if cacheable:
                 if len(self._verification_layouts) >= self.runtime.max_batch_size:
                     self._verification_layouts.pop(next(iter(self._verification_layouts)))
@@ -594,15 +597,13 @@ class Qwen35DFlashDecoder:
         if cacheable:
             self._verification_layouts.pop(lengths)
             self._verification_layouts[lengths] = layout
-        cu, topology, state_indices, seq_idx, local_state_indices = layout
+        cu, topology, state_indices, local_state_indices = layout
         output, predictions = self._verify(leases, verification=True, state_sources=sources if graph_staging else None,
             input_ids=ids, past_key_values=packed, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slot_mapping, page_table=page_table,
-            paged_kv_seqlens_k=torch.tensor([
-                session.cache.seq_length + length for session, length in zip(sessions, lengths)
-            ], device=device, dtype=torch.int32),
+            paged_kv_seqlens_k=used,
             cu_seq_lens_q=cu, sequence_lengths=lengths, topology_token=topology,
-            seq_idx=seq_idx,
+            seq_idx=metadata.seq_idx,
             gdn_state_indices=state_indices,
             gdn_state_indices_allocator_owned=True, capture_layers=self.draft.config.target_layer_ids)
         features = torch.cat(output.layer_hidden_states, dim=-1).split(lengths, dim=1)
