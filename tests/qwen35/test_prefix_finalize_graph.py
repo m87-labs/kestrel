@@ -207,7 +207,8 @@ def test_bound_target_entry_reuses_records_and_evicts_matching_finalizer(monkeyp
     graph._capture_layers = ()
     graph._linear = (0,)
     graph._text = SimpleNamespace(layers=[SimpleNamespace(linear_attn=SimpleNamespace(conv_kernel_size=4))])
-    graph._prefix_bindings = {2: ((SimpleNamespace(bind=bind), 1),)}
+    graph._block_size = 16
+    graph._prefix_bindings = {(2, 16): ((SimpleNamespace(bind=bind), 1),)}
     graph._graphs = SimpleNamespace(shutdown=lambda: None)
     graph._layouts = {}
 

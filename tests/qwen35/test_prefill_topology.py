@@ -24,6 +24,7 @@ def test_attention_uses_contiguous_kv_only_for_empty_packed_prefill(monkeypatch)
         layer_idx=0,
         scaling=2**-0.5,
         o_proj=lambda output: output,
+        verification_attention=lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         qwen_model,

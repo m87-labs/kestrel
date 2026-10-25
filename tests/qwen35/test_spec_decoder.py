@@ -356,9 +356,11 @@ def test_failed_second_admission_preserves_first_session():
 
 
 @pytest.mark.parametrize("concurrency", [1, 2, 4, 8])
-def test_dflash_config_accepts_concurrent_requests(concurrency):
+def test_dflash_config_accepts_concurrent_requests(monkeypatch, concurrency):
     from kestrel.config import RuntimeConfig
 
+    # This tests configuration admission, not CUDA driver availability.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     config = RuntimeConfig(model="Qwen/Qwen3.5-27B-FP8", model_path="unused",
                            draft_model_path="unused", max_batch_size=concurrency,
                            device="cuda", dtype=torch.bfloat16)
