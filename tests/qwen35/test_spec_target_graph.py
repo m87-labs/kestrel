@@ -65,10 +65,11 @@ def test_topology_owners_survive_capture_replacement_and_retirement():
     assert all(ref() is None for ref in owners)
 
 
-def test_captured_row_packing_matches_packed_inputs_without_mutating_sources():
+@pytest.mark.parametrize("count", [1, 2, 4, 8])
+def test_captured_row_packing_matches_packed_inputs_without_mutating_sources(count):
     config = SimpleNamespace(layer_types=("linear_attention", "linear_attention"))
     cache = Qwen35InferenceCache(config=config, paged_kv=(None, None))
-    rows = [torch.full((1, 2, 4), float(index)) for index in range(8)]
+    rows = [torch.full((1, 2, 4), float(index)) for index in range(4 * count)]
     seen = []
 
     @dataclass
@@ -89,32 +90,47 @@ def test_captured_row_packing_matches_packed_inputs_without_mutating_sources():
             for index, layer in enumerate(packed.layers):
                 state = initial[index] if initial is not None else layer.recurrent_states.clone()
                 packed._prefix_records[index] = SimpleNamespace(
-                    qkv=torch.zeros(1, 32, 2), a=torch.zeros(1), b=torch.zeros(1),
+                    qkv=torch.zeros(1, 16 * count, 2), a=torch.zeros(1), b=torch.zeros(1),
                     conv_input=torch.zeros(1), initial_state=state,
-                    state_indices=torch.arange(2), prefix_context=None)
+                    state_indices=torch.arange(count), prefix_context=None)
                 layer.conv_states.add_(10)
                 layer.recurrent_states.copy_(state + 10)
-            return SimpleNamespace(last_hidden_state=torch.zeros(1, 32, 2), layer_hidden_states=())
+            return SimpleNamespace(last_hidden_state=torch.zeros(1, 16 * count, 2), layer_hidden_states=())
 
     graph = object.__new__(Qwen35TargetGraph)
     graph._linear, graph._capture_layers, graph._prefix_bindings = (0, 1), (), {}
-    graph._layout = lambda count, device, *, width: (cache, (width,)*count, torch.tensor([0, 16, 32]), None)
+    graph._layout = lambda count, device, *, width: (cache, (width,)*count, torch.arange(count + 1) * 16, None)
     graph._text = Text()
     graph._runtime = SimpleNamespace(model=SimpleNamespace(lm_head=lambda hidden: hidden))
-    metadata = [torch.zeros(1, 32, dtype=torch.long) for _ in range(7)] + [torch.arange(2)]
+    metadata = [torch.zeros(1, 16 * count, dtype=torch.long) for _ in range(7)] + [torch.arange(count)]
     staged = graph._allocate_inputs(tuple(metadata + rows))
     for destination, source in zip(staged, metadata + rows, strict=True):
         destination.copy_(source)
-    assert staged[9].data_ptr() == staged[8].data_ptr() + rows[0].numel() * rows[0].element_size()
+    if count > 1:
+        assert staged[9].data_ptr() == staged[8].data_ptr() + rows[0].numel() * rows[0].element_size()
     output = graph._forward(*staged)
-    assert torch.equal(output[-1], torch.zeros(1, 32, dtype=torch.long))
+    assert torch.equal(output[-1], torch.zeros(1, 16 * count, dtype=torch.long))
     assert cache._prefix_initial_states is None
     assert all(torch.all(value == index) for index, value in enumerate(rows))
-    for offset, start in ((0, 2), (8, 6)):
-        torch.testing.assert_close(output[7 + offset], torch.cat(rows[start:start + 2]))
+    for offset, start in ((0, count), (8, 3 * count)):
+        torch.testing.assert_close(output[7 + offset], torch.cat(rows[start:start + count]))
         assert output[2 + offset].data_ptr() != output[7 + offset].data_ptr()
-    graph._forward(*metadata, *(torch.cat(rows[i:i+2]) for i in range(0, 8, 2)))
+    retained_initials = [output[7 + 8 * index].clone() for index in range(2)]
+    packed_inputs = [torch.cat(rows[i:i+count]) for i in range(0, 4 * count, count)]
+    packed_initials = [value.clone() for value in packed_inputs[1::2]]
+    packed_output = graph._forward(*metadata, *packed_inputs)
+    for index, (initial, original) in enumerate(zip(packed_inputs[1::2], packed_initials)):
+        if count == 1:
+            torch.testing.assert_close(initial, original)
+            assert packed_output[2 + 8 * index].data_ptr() != initial.data_ptr()
+            assert packed_output[7 + 8 * index] is initial
+        else:
+            torch.testing.assert_close(initial, original + 10)
+            assert packed_output[2 + 8 * index] is initial
     assert all(torch.equal(a, b) for a, b in zip(*seen, strict=True))
+    # A later forward replaces workspace owners, not the retained entry snapshots.
+    for index, initial in enumerate(retained_initials):
+        torch.testing.assert_close(output[7 + 8 * index], initial)
 
 
 @pytest.mark.parametrize("width", [1, 2, 3, 8, 16])
@@ -257,3 +273,30 @@ def test_invalid_proposal_shape_rejected_before_staging(lengths):
     with pytest.raises(ValueError):
         with target.launch(sequence_lengths=lengths):
             pytest.fail('invalid proposal shape was accepted')
+
+
+@pytest.mark.parametrize("count,state_rows", [(2, 2), (1, 2)])
+def test_packed_snapshot_domain_preserves_indexed_gather(count, state_rows):
+    cache = Qwen35InferenceCache(config=SimpleNamespace(layer_types=("linear_attention",)), paged_kv=(None,))
+    graph = object.__new__(Qwen35TargetGraph)
+    graph._linear = (0,)
+    graph._capture_layers = ()
+    graph._layout = lambda *args, **kwargs: (cache, (2,) * count, None, None)
+    state = torch.arange(state_rows, dtype=torch.float32).reshape(state_rows, 1, 1, 1)
+    indices = torch.tensor([1, 0]) if count == 2 else torch.tensor([0])
+    class Observed(Exception):
+        pass
+    def text(**kwargs):
+        # Nonrow C2 must still let the model gather by the supplied indices.
+        assert cache._prefix_initial_states is None
+        assert cache.layers[0].recurrent_states is state
+        torch.testing.assert_close(state[kwargs['gdn_state_indices']], torch.tensor([1., 0.]).reshape(2, 1, 1, 1))
+        raise Observed
+    graph._text = text
+    metadata = [torch.zeros(1, 2 * count, dtype=torch.long) for _ in range(7)] + [indices]
+    if count == 2:
+        with pytest.raises(Observed):
+            graph._forward(*metadata, torch.zeros(count, 1, 2), state)
+    else:
+        with pytest.raises(ValueError, match="one state row"):
+            graph._forward(*metadata, torch.zeros(count, 1, 2), state)

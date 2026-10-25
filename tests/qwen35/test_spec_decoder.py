@@ -906,3 +906,59 @@ def test_packed_predictions_transfer_once_for_ragged_reordered_cohorts(monkeypat
     if count > 1:
         results[0][0].append(-1)
         assert results[1][0] == [token + 1000 for token in candidates[1]]
+
+
+@pytest.mark.parametrize("capture,leased,graph", [(True, True, True), (True, False, True),
+                                                   (True, True, False), (False, False, True)])
+@pytest.mark.parametrize("fail", [False, True])
+def test_single_target_direct_staging_preserves_committed_owner(monkeypatch, capture, leased, graph, fail):
+    import kestrel.models.qwen35.spec_decoder as module
+    from kestrel.models.qwen35.cache import Qwen35InferenceCache
+
+    obj, _, _, _ = decoder()
+    obj.runtime.device = torch.device("cpu")
+    obj.runtime.page_size = 4
+    obj.runtime.page_table.page_table = torch.arange(16).reshape(2, 8)
+    obj.draft = SimpleNamespace(config=SimpleNamespace(target_layer_ids=(0,)))
+    obj._target_graph = object() if graph else None
+    source = Qwen35InferenceCache(config=SimpleNamespace(layer_types=("linear_attention",)), paged_kv=(None,))
+    source.seq_length = 3
+    source.layers[0].conv_states = torch.ones(1, 2, 4)
+    source.layers[0].recurrent_states = torch.ones(1, 2, 4, 4)
+    source.layers[0].has_previous_state = True
+    monkeypatch.setattr(module, "get_runtime", lambda: SimpleNamespace(gated_delta=SimpleNamespace(
+        bind_packed_prefill_topology=lambda **kwargs: (torch.tensor([0, 2]), object()))))
+    copies = []
+    original_copy = torch._foreach_copy_
+    def copy_many(destinations, sources):
+        copies.append(len(sources))
+        return original_copy(destinations, sources)
+    monkeypatch.setattr(torch, "_foreach_copy_", copy_many)
+    direct = capture and leased and graph
+    def verify(leases, **kwargs):
+        branch = kwargs['past_key_values']
+        assert branch is not source and branch.layers[0] is not source.layers[0]
+        assert kwargs['state_sources'] == ([source] if direct else None)
+        if direct:
+            assert branch.layers[0].recurrent_states is source.layers[0].recurrent_states
+            # Model the graph's publication of separate leased output storage.
+            branch.layers[0].recurrent_states = torch.full_like(source.layers[0].recurrent_states, 9)
+        else:
+            assert branch.layers[0].recurrent_states.data_ptr() != source.layers[0].recurrent_states.data_ptr()
+            branch.layers[0].recurrent_states.fill_(9)
+        if fail:
+            raise RuntimeError("verification failed before publication")
+        return SimpleNamespace(layer_hidden_states=(torch.zeros(1, 2, 3),)), torch.tensor([[7, 8]])
+    obj._verify = verify
+    if fail:
+        with pytest.raises(RuntimeError, match="before publication"):
+            Qwen35DFlashDecoder._target(obj, [4, 5], source, 1,
+                capture=capture, leases=object() if leased else None)
+    else:
+        _, _, branch = Qwen35DFlashDecoder._target(obj, [4, 5], source, 1,
+            capture=capture, leases=object() if leased else None)
+        assert branch.seq_length == 5
+    assert copies == ([] if direct else [2])
+    assert source.seq_length == 3
+    assert torch.all(source.layers[0].recurrent_states == 1)
+    assert torch.all(source.layers[0].conv_states == 1)

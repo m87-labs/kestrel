@@ -342,7 +342,12 @@ class Qwen35DFlashDecoder:
             else:
                 self._generated_verification = self._generated_verifiers[1]
             return self._generated_verification.target(tokens, committed, slot)
-        cache = committed.fork_recurrent_state(capture_prefix=capture)
+        graph_staging = capture and leases is not None and self._target_graph is not None
+        if graph_staging:
+            cache, _ = Qwen35InferenceCache.fork_packed_recurrent_state(
+                [committed], materialize=False)
+        else:
+            cache = committed.fork_recurrent_state(capture_prefix=capture)
         device = self.runtime.device
         start, length = committed.seq_length, len(tokens)
         ids = torch.tensor([tokens], device=device, dtype=torch.long)
@@ -353,6 +358,7 @@ class Qwen35DFlashDecoder:
         cu, topology = get_runtime().gated_delta.bind_packed_prefill_topology(
             sequence_lengths=(length,), device=device)
         output, predictions = self._verify(leases, last_token_only=not capture, verification=capture,
+            state_sources=[committed] if graph_staging else None,
             input_ids=ids, past_key_values=cache, position_ids=positions,
             cache_position_ids=positions, slot_mapping=slots, page_table=page_row,
             paged_kv_seqlens_k=torch.tensor([start+length], device=device, dtype=torch.int32),

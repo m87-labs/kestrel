@@ -96,7 +96,8 @@ class Qwen35TargetGraph:
         cache._prefix_records = {}
         states = iter(values[len(_INPUTS):])
         row_inputs = len(values) != len(_INPUTS) + 2 * len(self._linear)
-        cache._prefix_initial_states = {} if row_inputs else None
+        snapshot_inputs = row_inputs or count == 1
+        cache._prefix_initial_states = {} if snapshot_inputs else None
         if row_inputs:
             # Direct sources are supplied in sequence order, not pool-slot order.
             inputs['gdn_state_indices'] = torch.arange(count, device=inputs['input_ids'].device)
@@ -111,10 +112,17 @@ class Qwen35TargetGraph:
                     (count, *conv_rows[0].shape[1:]), conv_rows[0].stride())
                 initial = state_rows[0].as_strided(
                     (count, *state_rows[0].shape[1:]), state_rows[0].stride())
+            else:
+                layer.conv_states, initial = next(states), next(states)
+            if snapshot_inputs:
+                if initial.shape[0] != count:
+                    raise ValueError("verification snapshots require one state row per sequence")
+                # Identity-ordered inputs remain immutable within this replay.
+                # Packed nonrow inputs retain their indexed gather semantics.
                 cache._prefix_initial_states[index] = initial
                 layer.recurrent_states = torch.empty_like(initial)
             else:
-                layer.conv_states, layer.recurrent_states = next(states), next(states)
+                layer.recurrent_states = initial
             layer.has_previous_state = True
         output = self._text(**inputs, past_key_values=cache, cu_seq_lens_q=cu,
             sequence_lengths=lengths, topology_token=topology,
