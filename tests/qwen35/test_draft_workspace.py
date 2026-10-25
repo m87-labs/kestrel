@@ -594,3 +594,50 @@ def test_retained_draft_cohorts_replay_with_changed_equal_length_contexts(monkey
     finally:
         owner._draft_owners.shutdown()
     assert all(session.closed for session in retained.values())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("count", [1, 4, 8])
+def test_projected_draft_canonicalizes_strided_anchors(count, monkeypatch):
+    from kestrel.models.qwen35.dflash import DFlashContextCache, _LayerContextBuffer
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    model, seeds = _session_fixture()
+    caches = []
+    for slot in range(count):
+        cache = DFlashContextCache(64)
+        cache.length = 3
+        cache.layers = [_LayerContextBuffer(seeds[0].layers[0].keys.clone(),
+                                           seeds[0].layers[0].values.clone())]
+        caches.append(cache)
+    head = torch.nn.Linear(128, 257, bias=False).cuda().bfloat16().requires_grad_(False)
+    owner = DFlashDraftGraphSession(model, caches, lm_head=head, proposal_count=7)
+    captures = []
+    capture = owner.graph._capture
+    def observed(inputs):
+        captures.append(inputs[-1].stride())
+        return capture(inputs)
+    monkeypatch.setattr(owner.graph, "_capture", observed)
+    noise = [torch.randn(1, 16, 128, device="cuda", dtype=torch.bfloat16) for _ in caches]
+    features = [value[:, :0] for value in noise]
+    positions = [torch.arange(3, 19, device="cuda")[None] for _ in caches]
+    try:
+        for stride in (8, 17, 1, 8):
+            backing = torch.arange(count * stride, device="cuda").reshape(count, stride)
+            anchors = backing[:, 0]
+            fresh = DFlashDraftGraphSession(model, caches, lm_head=head, proposal_count=7)
+            try:
+                with fresh.launch(noise, features, positions, anchors.contiguous()) as result:
+                    expected = result.clone()
+            finally:
+                fresh.shutdown()
+            with owner.launch(noise, features, positions, anchors) as result:
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                captured_anchors = owner.graph.retained_io_tensors()[5]
+                assert captured_anchors.stride() == (1,)
+                assert captured_anchors.untyped_storage().nbytes() == count * 8
+                torch.testing.assert_close(captured_anchors, anchors, rtol=0, atol=0)
+                assert owner.known_owned_tensor_bytes() <= owner.known_tensor_reservation(
+                    model, caches, 7, projected=True)
+        assert captures == [(1,)]
+    finally:
+        owner.shutdown()

@@ -313,6 +313,11 @@ class DFlashDraftGraphSession:
             anchors = torch.zeros(count, device=parameter.device, dtype=torch.long)
         if anchors.shape != (count,) or anchors.device != parameter.device or anchors.dtype != torch.long:
             raise ValueError("draft anchors must match cache owners and device")
+        # Admission supplies anchors as noise[:, 0], which can have a padded
+        # row stride. Keep the captured layout and storage bound independent
+        # of the caller's layout, including when a retained owner is reused.
+        if anchors.stride() != (1,):
+            anchors = anchors.clone(memory_format=torch.contiguous_format)
         for noise, target, positions, cache, length in zip(
                 noise_embeddings, target_hiddens, position_ids, self.caches, lengths):
             if (noise.shape != (1, self.query_rows, config.hidden_size)
