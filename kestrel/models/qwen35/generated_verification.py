@@ -392,6 +392,8 @@ def validate_verification_capabilities(runtime, target_config):
     if path == "auto":
         path = runtime.decode_path
     if path == "native":
+        from .query_metadata import require_query_metadata
+        require_query_metadata(runtime.device)
         return
     from .dflash import DFlashConfig
     draft = DFlashConfig.from_dict(json.loads(
@@ -403,6 +405,8 @@ def validate_verification_capabilities(runtime, target_config):
             language_model=SimpleNamespace(config=target_config))))
     if path == "auto" and not Qwen35GeneratedVerification.supports(
             probe, SimpleNamespace(config=draft)):
+        from .query_metadata import require_query_metadata
+        require_query_metadata(runtime.device)
         return
     required = [("verification_pointwise", "stage_candidate")]
     if torch.cuda.get_device_capability(runtime.device) == (9, 0):
