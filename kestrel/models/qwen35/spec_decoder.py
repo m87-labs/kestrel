@@ -512,6 +512,10 @@ class Qwen35DFlashDecoder:
                   and graph.lengths == tuple(session.draft_cache.length for session in sessions)
                   and all(session.features.shape[1] <= config.block_size for session in sessions))
         self._last_draft_warm = warmed
+        # Pageable host uploads can synchronize their stream. Stage the known
+        # bonuses before that stream is ordered behind the draft computation.
+        anchors = torch.tensor([[session.bonus] for session in sessions],
+                               device=self.runtime.device, dtype=torch.long)
         if policy is not None:
             begin, end = self._draft_timing_events
             begin.record()
@@ -548,7 +552,6 @@ class Qwen35DFlashDecoder:
         if (tokens.ndim != 2 or tokens.shape[0] != count
                 or tokens.shape[1] < width - 1 or tokens.dtype not in (torch.int32, torch.int64)):
             raise ValueError("draft proposals require complete integer token rows")
-        anchors = tokens.new_tensor([[session.bonus] for session in sessions], dtype=torch.long)
         # Verification can consume these IDs before acceptance reads them on
         # the host. The new allocation also detaches them from draft graph I/O.
         return torch.cat((anchors, tokens[:, :width - 1]), dim=1)
@@ -711,6 +714,8 @@ class Qwen35DFlashDecoder:
         try:
             if len(sessions) == 1:
                 session = sessions[0][0]
+                anchor = (torch.tensor([session.bonus], device=self.runtime.device, dtype=torch.long)
+                          if self._generated_verification is None else None)
                 proposed = self.propose(session).token_ids[0]
                 if self._generated_verification is not None:
                     # Keep the draft on device until verification completes;
@@ -726,7 +731,7 @@ class Qwen35DFlashDecoder:
                         session.state.batch_idx, capture=True, leases=leases)]
                     candidates = [candidate.tolist()]
                 else:
-                    candidate = torch.cat((proposed.new_tensor([session.bonus], dtype=torch.long), proposed))
+                    candidate = torch.cat((anchor, proposed))
                     results = [self._target(candidate, session.cache,
                         session.state.batch_idx, capture=True, leases=leases)]
                     candidates = [candidate.tolist()]

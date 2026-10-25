@@ -35,7 +35,7 @@ def decoder():
     erased = []
     obj.runtime = SimpleNamespace(page_table=SimpleNamespace(
         free_batch_idx=[2], erase=erased.append), max_seq_length=128, vocab_size=256,
-        max_batch_size=2)
+        max_batch_size=2, device=torch.device('cpu'))
     obj.num_lookahead_tokens = 4
     obj.num_speculative_tokens = 3
     obj._sessions = {1: _Session(state, SimpleNamespace(seq_length=10), None, None, 7)}
@@ -975,7 +975,7 @@ def test_single_target_direct_staging_preserves_committed_owner(monkeypatch, cap
 @pytest.mark.parametrize('fail_commit', [False, True])
 @pytest.mark.parametrize('count', [2, 4, 8, 17])
 @pytest.mark.parametrize('token_dtype', [torch.int32, torch.int64])
-def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit, count, token_dtype):
+def test_batched_draft_context_commits_before_host_transfer(monkeypatch, warmed, fail_commit, count, token_dtype):
     from contextlib import contextmanager
     events = []
     obj, _, _, _ = decoder()
@@ -985,6 +985,13 @@ def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit,
     sessions = [SimpleNamespace(draft_cache=SimpleNamespace(length=row),
         cache=SimpleNamespace(seq_length=row+1), features=torch.ones(1, 1, 2), bonus=row)
         for row in range(count)]
+    tensor = torch.tensor
+    def upload(data, *args, **kwargs):
+        result = tensor(data, *args, **kwargs)
+        if kwargs.get('dtype') == torch.long and data == [[s.bonus] for s in sessions]:
+            events.append('anchors_uploaded')
+        return result
+    monkeypatch.setattr(torch, 'tensor', upload)
     class Tokens(torch.Tensor):
         def tolist(self):
             assert 'context_queued' in events
@@ -992,6 +999,7 @@ def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit,
             return super().tolist()
     @contextmanager
     def launch(*args, **kwargs):
+        assert events[0] == 'anchors_uploaded'
         # The sole strong output reference is transferred through the lease.
         yield torch.arange(count*3, dtype=token_dtype).reshape(count,3).as_subclass(Tokens)
         events.append('context_queued')
@@ -1023,6 +1031,24 @@ def test_batched_draft_context_commits_before_host_transfer(warmed, fail_commit,
         assert events.index('context_queued') < events.index('host_transfer')
         if warmed:
             assert events.index('context_queued') < events.index('unpin')
+
+
+def test_single_native_anchor_upload_precedes_draft(monkeypatch):
+    obj, state, _, _ = decoder()
+    calls = []
+    tensor = torch.tensor
+    def upload(*args, **kwargs):
+        calls.append('upload')
+        return tensor(*args, **kwargs)
+    monkeypatch.setattr(torch, 'tensor', upload)
+    def propose(session):
+        assert calls == ['upload']
+        calls.append('draft')
+        return DraftResult(tensor([[8, 9, 10]], dtype=torch.int32))
+    obj.propose = propose
+    result = obj.step([state])
+    assert calls == ['upload', 'draft']
+    assert result.tokens == [[8, 9, 99]]
 
 
 @pytest.mark.parametrize('count', [1, 2, 4, 8, 17])
