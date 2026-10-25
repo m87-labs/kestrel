@@ -48,8 +48,13 @@ class NativeVerificationProjections:
     entries share expert scratch and cannot execute concurrently. Outputs and
     recurrent-state ownership remain with their individual graph entries.
     """
-    def __init__(self, modules, *, max_verification_tokens=None, attention_splits=None, attention_implementation="simt"):
-        from kestrel_kernels.verification_dense import PreparedDense
+    def __init__(self, modules, *, max_verification_tokens=None, attention_splits=None, attention_implementation="simt", projection_path="canonical"):
+        if projection_path not in ("canonical", "default"):
+            raise ValueError("unsupported verification projection path")
+        if projection_path == "default" and attention_splits is None:
+            raise ValueError("default verification projections require explicit attention splits")
+        if projection_path == "canonical":
+            from kestrel_kernels.verification_dense import PreparedDense
         if attention_splits is not None and (type(attention_splits) is not int or attention_splits not in (1, 2, 4, 8)):
             raise ValueError("unsupported explicit verification attention split count")
         if attention_implementation not in ('simt', 'packed_mma', 'packed_mma_overlap') or (attention_implementation != 'simt' and attention_splits not in (2, 4, 8)):
@@ -59,7 +64,7 @@ class NativeVerificationProjections:
         self.closed = False
         self.active = ContextVar(f'verification-projections-{id(self)}', default=False)
         owners = tuple(module for module in modules
-                       if isinstance(module, (VerificationProjection, VerificationExperts))
+                       if (projection_path == "canonical" and isinstance(module, (VerificationProjection, VerificationExperts)))
                        or (attention_splits is not None and isinstance(module, VerificationAttention)))
         if any(module._verification_scope is not None for module in owners):
             raise ValueError('verification projections already belong to a runtime')

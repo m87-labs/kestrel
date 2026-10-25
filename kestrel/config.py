@@ -192,6 +192,9 @@ class RuntimeConfig:
     verification_path: DecodePath = "auto"
     # Explicit native verification prefix cap; None preserves the draft block.
     verification_width: int | None = None
+    # Explicit component choice; not an automatic performance policy.
+    # "default" retains ordinary projection math without canonical weight copies.
+    verification_projection_path: str = "canonical"
 
     # Explicit diagnostic candidate; no automatic cost selection.
     verification_attention_splits: int | None = None
@@ -200,6 +203,12 @@ class RuntimeConfig:
     def __post_init__(self):
         if self.verification_path not in ("auto", "native", "generated"):
             raise ValueError("verification_path must be auto, native, or generated")
+        if self.verification_projection_path not in ("canonical", "default"):
+            raise ValueError("verification_projection_path must be canonical or default")
+        if self.verification_projection_path == "default" and self.verification_path != "native":
+            raise ValueError("default verification projections require explicit native verification")
+        if self.verification_projection_path == "default" and self.verification_attention_splits is None:
+            raise ValueError("default verification projections require explicit attention splits")
         if self.verification_width is not None and (
             type(self.verification_width) is not int or self.verification_width < 1
             or self.verification_path != "native"

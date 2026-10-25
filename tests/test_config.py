@@ -189,3 +189,30 @@ def test_verification_attention_rejects_unsupported_implementation(implementatio
     with pytest.raises(ValueError):
         RuntimeConfig(model_path='/weights',verification_path='native',verification_attention_splits=splits,
                       verification_attention_implementation=implementation)
+
+
+@pytest.mark.parametrize('path', ['auto', 'generated', 'unknown', None])
+def test_verification_projection_path_rejects_unknown_component(path):
+    with pytest.raises(ValueError, match='verification_projection_path'):
+        RuntimeConfig(model_path='/weights', device='cpu', verification_projection_path=path)
+
+
+@pytest.mark.parametrize('backend', ['auto', 'generated'])
+def test_default_verification_projection_requires_explicit_native(backend):
+    with pytest.raises(ValueError, match='explicit native'):
+        RuntimeConfig(model_path='/weights', device='cpu', verification_path=backend,
+                      verification_projection_path='default')
+
+
+def test_attention_can_retain_default_projection_math():
+    cfg=RuntimeConfig(model_path='/weights',device='cpu',verification_path='native',
+        verification_projection_path='default',verification_attention_splits=8,
+        verification_attention_implementation='packed_mma')
+    assert cfg.verification_projection_path == 'default'
+    assert RuntimeConfig(model_path='/weights',device='cpu').verification_projection_path == 'canonical'
+
+
+def test_default_verification_projection_requires_attention_component():
+    with pytest.raises(ValueError, match="explicit attention splits"):
+        RuntimeConfig(model_path="/weights",device="cpu",verification_path="native",
+                      verification_projection_path="default")

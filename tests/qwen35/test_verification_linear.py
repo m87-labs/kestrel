@@ -84,7 +84,7 @@ def test_decoder_constructor_failure_releases_projection_owner(fake_plans,monkey
     text.config=SimpleNamespace(hidden_size=4,num_hidden_layers=1,vocab_size=16)
     model=SimpleNamespace(model=SimpleNamespace(language_model=text),lm_head=VerificationLinear(4,16,bias=False))
     runtime=SimpleNamespace(device=torch.device('cuda'),dtype=torch.bfloat16,model=model,
-        _cfg=SimpleNamespace(enable_cuda_graphs=True,verification_path='native',verification_attention_splits=None, verification_attention_implementation="simt"),
+        _cfg=SimpleNamespace(enable_cuda_graphs=True,verification_path='native',verification_projection_path='canonical',verification_attention_splits=None, verification_attention_implementation="simt"),
         decode_path='generated',max_batch_size=1)
     draft=SimpleNamespace(config=SimpleNamespace(hidden_size=4,target_layer_ids=(0,),
         mask_token_id=0,vocab_size=16,selector_rank=0,block_size=4))
@@ -151,3 +151,43 @@ def test_expert_plan_failure_does_not_publish_dense_binding(fake_plans, monkeypa
         NativeVerificationProjections([a,b], max_verification_tokens=128)
     assert a._verification_scope is b._verification_scope is None
     assert not hasattr(a, '_verification_projection')
+
+
+def test_attention_only_owner_does_not_prepare_or_bind_projections(monkeypatch):
+    from kestrel.models.qwen35.verification_linear import VerificationExperts
+    from kestrel.models.qwen35.verification_attention import VerificationAttention
+    class Attention(torch.nn.Module, VerificationAttention):
+        pass
+    class Experts(torch.nn.Module, VerificationExperts):
+        def verification_moe_spec(self):
+            raise AssertionError('default projections must not prepare experts')
+    def forbidden(*args, **kwargs):
+        raise AssertionError('default projections must not prepare dense weights')
+    monkeypatch.setitem(sys.modules,'kestrel_kernels.verification_dense',SimpleNamespace(PreparedDense=forbidden))
+    linear=VerificationLinear(4,3,bias=False);attention=Attention();experts=Experts()
+    x=torch.randn(2,4);expected=linear(x)
+    for _ in range(2):
+        owner=NativeVerificationProjections([linear,attention,experts],projection_path='default',
+            attention_splits=4,attention_implementation='packed_mma')
+        assert owner.plans == (None,)
+        assert linear._verification_scope is experts._verification_scope is None
+        assert attention._verification_scope is owner
+        with pytest.raises(RuntimeError,match='intentional'):
+            with owner.activate():
+                torch.testing.assert_close(linear(x),expected,rtol=0,atol=0)
+                assert experts.verification_moe_handle(None,None) is None
+                raise RuntimeError('intentional')
+        assert not owner.active.get()
+        owner.close()
+        assert attention._verification_scope is None
+
+
+@pytest.mark.parametrize('path', ['auto','generated','unknown',None])
+def test_projection_owner_rejects_unsupported_component_path(path):
+    with pytest.raises(ValueError,match='projection path'):
+        NativeVerificationProjections([],projection_path=path)
+
+
+def test_default_projection_owner_requires_attention_component():
+    with pytest.raises(ValueError, match="explicit attention splits"):
+        NativeVerificationProjections([],projection_path="default")

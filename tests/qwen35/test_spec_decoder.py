@@ -746,7 +746,7 @@ def test_verification_backend_is_independent(monkeypatch, verification, decode, 
                                                   vocab_size=16), modules=lambda: ())
     runtime = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16,
         model=SimpleNamespace(model=SimpleNamespace(language_model=text), lm_head=None),
-        _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path=verification, verification_attention_splits=None, verification_attention_implementation="simt"),
+        _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path=verification, verification_projection_path="canonical", verification_attention_splits=None, verification_attention_implementation="simt"),
         decode_path=decode, max_batch_size=1)
     monkeypatch.setattr(module, "load_dflash_drafter", lambda *a, **k: draft)
     from kestrel.models.qwen35 import verification_linear
@@ -824,7 +824,7 @@ def test_native_prefix_cap_cannot_exceed_loaded_draft_block(monkeypatch):
         mask_token_id=0, vocab_size=16, selector_rank=0, block_size=4))
     runtime = SimpleNamespace(model=SimpleNamespace(model=SimpleNamespace(language_model=text)),
         device=torch.device('cuda'), dtype=torch.bfloat16,
-        _cfg=SimpleNamespace(verification_path='native', verification_width=5))
+        _cfg=SimpleNamespace(verification_path='native',verification_projection_path='canonical', verification_width=5))
     monkeypatch.setattr(module, 'load_dflash_drafter', lambda *args, **kwargs: draft)
     with pytest.raises(ValueError, match='fit the draft block'):
         module.Qwen35DFlashDecoder(runtime, 'draft')
