@@ -78,7 +78,7 @@ for count in range(bounds['sequences'].lower, bounds['sequences'].upper + 1):
             raise RuntimeError(f'missing native prefix runtime route: {nk=}, {nv=}, {dk=}, {dv=}, {width=}, {count=}')
         stages = {}
         with capture_packed_artifact_receipts() as prepare_artifacts:
-            r.packed_prefill_prepare(mixed,gate,beta,log_decay,bias,cu_seqlens=cu,sequence_lengths=(width,)*count,topology_token=topology,query=workspace.query,key=workspace.key,value=workspace.value,g=workspace.log_g,beta=workspace.beta_fp32)
+            r.packed_prefill_prepare(mixed,gate,beta,log_decay,bias,query=workspace.query,key=workspace.key,value=workspace.value,g=workspace.log_g,beta=workspace.beta_fp32)
         stages['prepare'] = prepare_artifacts.receipts
         def execute():
             with capture_packed_artifact_receipts() as verify_artifacts:
