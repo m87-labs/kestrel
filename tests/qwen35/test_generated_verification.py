@@ -19,7 +19,7 @@ def _verification_runtime(*, capacity=1, page_size=1, weight_format="fp8_e4m3"):
                              dense_weight_format=weight_format)
     return SimpleNamespace(
         max_batch_size=capacity, page_size=page_size, device=torch.device("cuda"),
-        dtype=torch.bfloat16, decode_path="auto", _cfg=SimpleNamespace(enable_cuda_graphs=False),
+        dtype=torch.bfloat16, decode_path="auto", _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path="auto"),
         model=SimpleNamespace(model=SimpleNamespace(language_model=SimpleNamespace(config=target))))
 
 
@@ -65,11 +65,12 @@ def test_dflash_auto_constructs_supported_generated_verifiers(monkeypatch, capac
     monkeypatch.setattr(spec_decoder, "load_dflash_drafter", lambda *a, **k: draft)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
     monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
-    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: object())
     rows = []
     def init(self, runtime, draft, *, sequences=1, weights=None):
         rows.append(sequences)
         self.weights = object()
+        self.segmented = False
     monkeypatch.setattr(Qwen35GeneratedVerification, "__init__", init)
     decoder = spec_decoder.Qwen35DFlashDecoder(runtime, "draft")
     assert rows == expected_rows
@@ -82,7 +83,7 @@ def test_dflash_auto_does_not_hide_generated_binding_errors(monkeypatch):
     monkeypatch.setattr(spec_decoder, "load_dflash_drafter", lambda *a, **k: _verification_draft())
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
     monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: object())
-    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: object())
     def init(self, *args, **kwargs):
         raise RuntimeError("missing AOT Qwen generated verification program")
     monkeypatch.setattr(Qwen35GeneratedVerification, "__init__", init)
@@ -91,8 +92,8 @@ def test_dflash_auto_does_not_hide_generated_binding_errors(monkeypatch):
 
 
 def test_generated_verification_rejects_unqualified_concurrency():
-    with pytest.raises(ValueError, match="one or two sequences"):
-        Qwen35GeneratedVerification(SimpleNamespace(max_batch_size=3), None)
+    with pytest.raises(ValueError, match="up to eight sequences"):
+        Qwen35GeneratedVerification(SimpleNamespace(max_batch_size=9), None)
 
 
 @pytest.mark.parametrize("count", [0, 17, True, -1])
@@ -108,6 +109,17 @@ def test_generated_verification_rejects_overlapping_blocks():
     target.pending = True
     with pytest.raises(RuntimeError, match="uncommitted block"):
         target.target([], None, 0)
+
+
+@pytest.mark.parametrize("shape,dtype", [((16,), torch.int32), ((1, 15), torch.int32),
+                                       ((1, 16), torch.float32)])
+def test_generated_verification_rejects_invalid_device_candidates(shape, dtype):
+    target = Qwen35GeneratedVerification.__new__(Qwen35GeneratedVerification)
+    target.pending, target.sequences, target.block = False, 1, 16
+    target.runtime = SimpleNamespace(device="cpu")
+    with pytest.raises(ValueError, match="device-local integer token rows"):
+        target.target_many(torch.zeros(shape, dtype=dtype), [None], [0])
+    assert not target.pending
 
 
 def test_generated_verification_commits_independent_rows_once(monkeypatch):
@@ -141,7 +153,8 @@ def test_generated_verification_commits_independent_rows_once(monkeypatch):
     assert replayed == [(1, 4), (0, 2)]
 
 
-def test_generated_verification_retains_sources_when_rows_swap(monkeypatch):
+@pytest.mark.parametrize("device_candidates", [False, True])
+def test_generated_verification_retains_sources_when_rows_swap(monkeypatch, device_candidates):
     target = Qwen35GeneratedVerification.__new__(Qwen35GeneratedVerification)
     target.pending, target.block, target.sequences = False, 8, 2
     target.invocation, target.stream = object(), object()
@@ -171,7 +184,10 @@ def test_generated_verification_retains_sources_when_rows_swap(monkeypatch):
         target.accepted[row].layers[0].conv_states.copy_(histories[0] + count)
     target.replays = [SimpleNamespace(launch=lambda s, h, c: replay(0, s, h, c)),
                       SimpleNamespace(launch=lambda s, h, c: replay(1, s, h, c))]
-    results = target.target_many([list(range(8))] * 2, list(reversed(target.accepted)), [1, 0])
+    candidates = [list(range(8))] * 2
+    if device_candidates:
+        candidates = torch.tensor(candidates, dtype=torch.int32)
+    results = target.target_many(candidates, list(reversed(target.accepted)), [1, 0])
     sessions = [SimpleNamespace(), SimpleNamespace()]
     for row, (expected, features, verified) in enumerate(results):
         target.commit((sessions[row], verified, features, expected, row + 2))
@@ -250,3 +266,129 @@ def test_generated_verification_long_reasoning_does_not_repeat_zeros():
             await engine.shutdown()
 
     asyncio.run(run())
+
+
+def _hopper_verification_runtime(capacity=1):
+    runtime, draft = _verification_runtime(capacity=capacity, weight_format='bf16'), _verification_draft()
+    target = runtime.model.model.language_model.config
+    target.__dict__.update(
+        hidden_size=2048, num_hidden_layers=40, num_attention_heads=16,
+        num_key_value_heads=2, head_dim=256, num_experts=256, num_experts_per_tok=8,
+        moe_intermediate_size=512, shared_expert_intermediate_size=512,
+        linear_num_key_heads=16, linear_num_value_heads=32, linear_key_head_dim=128,
+        linear_value_head_dim=128, expert_weight_format='bf16',
+        linear_conv_kernel_dim=4, rms_norm_eps=1e-6, partial_rotary_factor=0.25,
+        tie_word_embeddings=False, mrope_section=(11, 11, 10),
+        layer_types=('linear_attention', 'linear_attention', 'linear_attention', 'full_attention') * 10)
+    draft.config.target_layer_ids = (1, 6, 11, 16, 22, 27, 32, 37)
+    return runtime, draft
+
+
+@pytest.mark.parametrize('verification_rows', (4, 6, 8, 16))
+@pytest.mark.parametrize('mutation', ['none', 'taps', 'capacity', 'experts', 'order', 'page'])
+def test_hopper_verification_rejects_wrong_contract_before_materializing(monkeypatch, mutation, verification_rows):
+    from kestrel.models.qwen35 import generated_verification as module
+
+    runtime, draft = _hopper_verification_runtime()
+    target = runtime.model.model.language_model.config
+    if mutation == 'taps': draft.config.target_layer_ids = (0, 1)
+    elif mutation == 'capacity': runtime.max_batch_size = 9
+    elif mutation == 'experts': target.num_experts = 128
+    elif mutation == 'order': target.layer_types = tuple(reversed(target.layer_types))
+    elif mutation == 'page': runtime.page_size = 64
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device: (9, 0))
+    monkeypatch.setattr(torch.cuda, 'get_device_properties',
+                        lambda device: SimpleNamespace(multi_processor_count=132))
+    resolved = []
+    def resolve(**kwargs):
+        resolved.append(kwargs)
+        return None
+    monkeypatch.setattr(module, 'resolve_program', resolve)
+    if mutation == 'none':
+        with pytest.raises(RuntimeError, match='missing AOT'):
+            Qwen35GeneratedVerification(runtime, draft, verification_rows=verification_rows)
+        assert resolved[0]['registration'] == 'qwen35_moe_verification'
+        assert resolved[0]['verification'] is True
+        assert resolved[0]['program'].endswith(f'_t{verification_rows}')
+        # Disabling graphs retains the ordinary path; only the exact validated
+        # Hopper contract is admitted automatically with graphs enabled.
+        assert not Qwen35GeneratedVerification.supports(runtime, draft)
+        runtime._cfg.enable_cuda_graphs = True
+        assert Qwen35GeneratedVerification.supports(runtime, draft)
+    else:
+        with pytest.raises(ValueError):
+            Qwen35GeneratedVerification(runtime, draft, verification_rows=verification_rows)
+        assert not resolved
+
+
+@pytest.mark.parametrize('slot,start', [(-1, 0), (1, 0), (0, -1), (0, 32760)])
+def test_segmented_verification_rejects_kv_overflow_before_prepare(slot, start):
+    target = Qwen35GeneratedVerification.__new__(Qwen35GeneratedVerification)
+    target.pending, target.block, target.sequences = False, 16, 1
+    target.segmented, target.invocation = True, None
+    target.runtime = SimpleNamespace(page_table=SimpleNamespace(page_table=torch.empty(1, 32768)))
+    target._prepare = lambda *_: pytest.fail('invalid request reached GPU preparation')
+    with pytest.raises(ValueError, match='page table'):
+        target.target_many([list(range(16))], [SimpleNamespace(seq_length=start)], [slot])
+
+
+def test_automatic_loading_does_not_allocate_for_unqualified_target(tmp_path, monkeypatch):
+    from kestrel.models.qwen35 import generated_verification as module
+    from kestrel.models.qwen35.dflash import DFlashConfig
+    (tmp_path / 'config.json').write_text('{}')
+    runtime = _verification_runtime(weight_format='bf16')
+    runtime.decode_path = 'auto'
+    runtime._draft_model_path = tmp_path
+    runtime._cfg.enable_cuda_graphs = True
+    runtime._cfg.page_size = 1
+    draft = _verification_draft().config
+    draft.target_layer_ids = (1,6,11,16,22,27,32,37)
+    monkeypatch.setattr(DFlashConfig, 'from_dict', lambda data: draft)
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device: (9,0))
+    monkeypatch.setattr(module, 'resolve_program', lambda **kwargs: pytest.fail('unqualified target resolved an AOT program'))
+    prepare, finalize = module.verification_weight_loading_callbacks(runtime)
+    prepare(runtime.model)
+    finalize(runtime.model)
+    assert not hasattr(runtime, '_verification_weight_storage')
+    runtime.decode_path = 'generated'
+    prepare, finalize = module.verification_weight_loading_callbacks(runtime)
+    with pytest.raises(ValueError, match='unsupported Hopper'):
+        prepare(runtime.model)
+
+
+@pytest.mark.parametrize('sequences', [5, 6, 7, 8])
+@pytest.mark.parametrize('width', [2, 4])
+def test_hopper_extended_capacity_requires_exact_packaged_span(monkeypatch, sequences, width):
+    from kestrel.models.qwen35 import generated_verification as module
+    runtime, draft = _hopper_verification_runtime(8)
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device: (9, 0))
+    monkeypatch.setattr(torch.cuda, 'get_device_properties',
+                        lambda device: SimpleNamespace(multi_processor_count=132))
+    seen = []
+    monkeypatch.setattr(module, 'resolve_program', lambda **kwargs: seen.append(kwargs))
+    if width == 2:
+        with pytest.raises(RuntimeError, match='missing AOT'):
+            Qwen35GeneratedVerification(runtime, draft, sequences=sequences,
+                                         verification_rows=width)
+        assert seen[0]['program'].endswith(f'_c{sequences}_t2')
+    else:
+        with pytest.raises(ValueError, match='unsupported concurrent'):
+            Qwen35GeneratedVerification(runtime, draft, sequences=sequences,
+                                         verification_rows=width)
+        assert not seen
+    # The opt-in compiled path still requires numerical qualification before
+    # automatic admission is expanded beyond the existing supported contract.
+    runtime._cfg.enable_cuda_graphs = True
+    assert not Qwen35GeneratedVerification.supports(runtime, draft)
+
+
+def test_native_verification_loading_never_resolves_generated_inventory(monkeypatch):
+    from kestrel.models.qwen35 import generated_verification as module
+    runtime = _verification_runtime(weight_format="bf16")
+    runtime.decode_path = "generated"
+    runtime._cfg.verification_path = "native"
+    monkeypatch.setattr(torch.cuda, "get_device_capability",
+        lambda device: pytest.fail("native verification must bypass generated loader"))
+    monkeypatch.setattr(module, "resolve_program",
+        lambda **kwargs: pytest.fail("native verification resolved generated inventory"))
+    assert module.verification_weight_loading_callbacks(runtime) == (None, None)

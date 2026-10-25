@@ -134,7 +134,7 @@ def test_stable_attention_layer_matches_eager_sessions(sliding):
         graph.shutdown()
 
 
-def _session_fixture():
+def _session_fixture(capacity=64):
     from kestrel.models.qwen35.dflash import (
         DFlashConfig, DFlashDraftModel, DFlashContextCache, _LayerContextBuffer)
     config = DFlashConfig(128, 256, 1, 4, 1, 128, 1e-6, 10000, 16, 0,
@@ -142,21 +142,23 @@ def _session_fixture():
     model = DFlashDraftModel(config).cuda().bfloat16().requires_grad_(False)
     caches = []
     for slot in range(2):
-        cache = DFlashContextCache(64)
+        cache = DFlashContextCache(capacity)
         cache.length = slot + 3
-        keys = torch.full((1, 64, 1, 128), slot + 1, device="cuda", dtype=torch.bfloat16)
+        keys = torch.full((1, capacity, 1, 128), slot + 1, device="cuda", dtype=torch.bfloat16)
         cache.layers = [_LayerContextBuffer(keys, keys.clone())]
         caches.append(cache)
     return model, caches
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_captured_draft_head_matches_eager_projection():
+@pytest.mark.parametrize("proposal_count", [1, 3, 7, 15])
+def test_captured_draft_head_matches_eager_projection(proposal_count):
     from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
     model, caches = _session_fixture()
     head = torch.nn.Linear(128, 257, bias=False).cuda().bfloat16().requires_grad_(False)
     hidden_session = DFlashDraftGraphSession(model, caches)
-    token_session = DFlashDraftGraphSession(model, caches, lm_head=head)
+    token_session = DFlashDraftGraphSession(model, caches, lm_head=head,
+                                                 proposal_count=proposal_count)
     noise = [torch.randn(1, 16, 128, device="cuda", dtype=torch.bfloat16) for _ in caches]
     features = [value[:, :0] for value in noise]
     positions = [torch.arange(cache.length, cache.length + 16, device="cuda")[None]
@@ -164,7 +166,7 @@ def test_captured_draft_head_matches_eager_projection():
     try:
         for _ in range(3):
             with hidden_session.launch(noise, features, positions) as hidden:
-                expected = head(hidden[:, 1:].reshape(1, -1, 128)).argmax(-1).reshape(2, 15)
+                expected = head(hidden[:, 1:].reshape(1, -1, 128)).argmax(-1).reshape(2, 15)[:, :proposal_count]
             with token_session.launch(noise, features, positions) as tokens:
                 assert tokens.dtype == torch.int32
                 assert torch.equal(tokens, expected)
@@ -233,7 +235,8 @@ def test_draft_session_retirement_reorder_and_external_advance():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_draft_rebind_keeps_one_capture_and_rejects_active_lease(monkeypatch):
+@pytest.mark.parametrize("replacement_capacity", (32, 64))
+def test_draft_rebind_keeps_one_capture_and_rejects_active_lease(monkeypatch, replacement_capacity):
     from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
     model, caches = _session_fixture()
     session = DFlashDraftGraphSession(model, caches)
@@ -248,7 +251,7 @@ def test_draft_rebind_keeps_one_capture_and_rejects_active_lease(monkeypatch):
     try:
         for iteration in range(2):
             if iteration:
-                _, new_caches = _session_fixture()
+                _, new_caches = _session_fixture(replacement_capacity)
                 for slot, cache in enumerate(new_caches):
                     cache.layers[0].keys.fill_(slot + 7)
                     cache.layers[0].values.fill_(slot + 8)
@@ -299,19 +302,13 @@ def test_draft_staging_survives_delayed_copy_and_allocator_churn():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_draft_commit_is_visible_to_ambient_eager_consumer(monkeypatch):
+def test_draft_commit_is_visible_to_ambient_eager_consumer():
     from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
     model, caches = _session_fixture()
     session = DFlashDraftGraphSession(model, caches)
     consumer = torch.cuda.Stream()
     consumer.wait_stream(torch.cuda.current_stream())
     starts = [cache.length for cache in caches]
-    copy_batches = []
-    original_copy = torch._foreach_copy_
-    def copy_many(destinations, sources):
-        copy_batches.append(len(destinations))
-        return original_copy(destinations, sources)
-    monkeypatch.setattr(torch, "_foreach_copy_", copy_many)
     try:
         with torch.cuda.stream(consumer):
             noise = [torch.zeros(1, 16, 128, device="cuda", dtype=torch.bfloat16) for _ in caches]
@@ -321,8 +318,6 @@ def test_draft_commit_is_visible_to_ambient_eager_consumer(monkeypatch):
                 output[0, 0, 0].item()
                 # Commit copies are submitted after this consumer returns.
                 torch.cuda._sleep(10000000)
-                copy_batches.clear()
-            assert copy_batches == [2 * len(session.workspaces) * len(caches)]
             for cache, start in zip(caches, starts):
                 assert cache.length == start + 1
                 assert (cache.layers[0].keys[:, start:start + 1] == 0).all()
@@ -333,3 +328,210 @@ def test_draft_commit_is_visible_to_ambient_eager_consumer(monkeypatch):
             assert all(torch.isfinite(value).all() for value in result)
     finally:
         session.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_draft_rebind_rejects_larger_owner_before_mutation():
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    model, caches = _session_fixture()
+    session = DFlashDraftGraphSession(model, caches)
+    _, oversized = _session_fixture(128)
+    try:
+        with pytest.raises(ValueError, match="retained slot capacity"):
+            session.rebind(oversized)
+        assert session.caches == tuple(caches)
+        assert session.lengths == tuple(cache.length for cache in caches)
+    finally:
+        session.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_decoder_reuses_fitting_draft_workspace_and_grows_for_larger_owner():
+    from types import SimpleNamespace
+    from kestrel.models.qwen35.spec_decoder import Qwen35DFlashDecoder
+    model, _ = _session_fixture()
+    owner = SimpleNamespace(_draft_graph_enabled=True, _draft_graph=None, draft=model,
+                            _generated_verification=None,
+                            runtime=SimpleNamespace(model=SimpleNamespace(lm_head=None)))
+    sessions = []
+    try:
+        for capacity in (64, 32, 128):
+            _, caches = _session_fixture(capacity)
+            noise = [torch.zeros(1, 16, 128, device="cuda", dtype=torch.bfloat16) for _ in caches]
+            features = [value[:, :0] for value in noise]
+            positions = [torch.arange(c.length, c.length + 16, device="cuda")[None] for c in caches]
+            with Qwen35DFlashDecoder._draft_tokens(owner, noise, features, positions, caches) as result:
+                assert result.shape == (2, 16, 128)
+            sessions.append(owner._draft_graph)
+        assert sessions[0] is sessions[1]
+        assert sessions[2] is not sessions[1]
+        assert sessions[1].closed
+        assert sessions[2].workspaces[0].capacity == 128
+    finally:
+        if owner._draft_graph is not None:
+            owner._draft_graph.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+def test_direct_token_staging_matches_normal_lease_and_commits_only_context():
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    from kestrel.models.qwen35.dflash import DFlashContextCache, _LayerContextBuffer
+    model, caches = _session_fixture(128)
+    cache = caches[0]
+    reference_cache = DFlashContextCache(cache.capacity)
+    reference_cache.length = cache.length
+    reference_cache.layers = [_LayerContextBuffer(layer.keys.clone(), layer.values.clone())
+                              for layer in cache.layers]
+    head = torch.nn.Linear(128, 257, bias=False).cuda().bfloat16().requires_grad_(False)
+    embedding = torch.randn(257, 128, device='cuda', dtype=torch.bfloat16)
+    direct = DFlashDraftGraphSession(model, [cache], lm_head=head)
+    normal = DFlashDraftGraphSession(model, [reference_cache], lm_head=head)
+    try:
+        for index, length in enumerate((0, 1, 6, 16, 0)):
+            start = cache.length
+            features = torch.randn(1, length, 128, device='cuda', dtype=torch.bfloat16)
+            ids = torch.full((1,16), model.config.mask_token_id, device='cuda', dtype=torch.long)
+            ids[0,0] = 7
+            noise = torch.nn.functional.embedding(ids, embedding)
+            positions = torch.arange(start, start+length+16, device='cuda')[None]
+            with normal.launch([noise], [features], [positions], ids[:,0]) as output:
+                expected = output.clone()
+            launch = (direct.launch([noise], [features], [positions], ids[:,0]) if index == 0 else
+                      direct.launch_tokens(features, embedding, bonus=7, target_position=start+length))
+            with launch as actual:
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            assert cache.length == reference_cache.length == start+length
+            for a,b in zip(cache.layers, reference_cache.layers):
+                torch.testing.assert_close(a.keys[:,:cache.length], b.keys[:,:cache.length], atol=0, rtol=0)
+                torch.testing.assert_close(a.values[:,:cache.length], b.values[:,:cache.length], atol=0, rtol=0)
+    finally:
+        direct.shutdown()
+        normal.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_retired_draft_session_releases_storage_before_replacement():
+    import weakref
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+
+    model, caches = _session_fixture(2048)
+    session = DFlashDraftGraphSession(model, caches)
+    refs = [weakref.ref(value) for workspace in session.workspaces
+            for value in (workspace.keys, workspace.values)]
+    refs.extend((weakref.ref(session.targets), weakref.ref(session.positions)))
+    session.shutdown()
+    # Keep the retired session alive: construction of its replacement evaluates
+    # before assignment drops the previous owner, and callers may retain it too.
+    assert session.closed
+    assert all(reference() is None for reference in refs)
+    assert all(cache.layers[0].keys is not None for cache in caches)
+    session.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_draft_rejects_noncontiguous_owner_cache():
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    model, caches = _session_fixture()
+    for cache in caches:
+        layer = cache.layers[0]
+        for name in ("keys", "values"):
+            original = getattr(layer, name)
+            padded = torch.empty((*original.shape[:-1], original.shape[-1] + 1),
+                                 device=original.device, dtype=original.dtype)
+            value = padded[..., :-1]
+            value.copy_(original)
+            setattr(layer, name, value)
+    with pytest.raises(ValueError, match="contiguous cache storage"):
+        DFlashDraftGraphSession(model, caches)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("owners", [1, 3, 8, 16, 32])
+def test_context_copy_binding_has_no_concurrency_whitelist(owners):
+    from types import SimpleNamespace
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    session = object.__new__(DFlashDraftGraphSession)
+    session.context_rows = 3
+    session.stream = torch.cuda.current_stream()
+    session.workspaces = [SimpleNamespace(
+        keys=torch.empty(owners, 19, 2, 7, device="cuda", dtype=torch.bfloat16),
+        values=torch.empty(owners, 19, 2, 7, device="cuda", dtype=torch.bfloat16))]
+    session.caches = tuple(SimpleNamespace(layers=[SimpleNamespace(
+        keys=torch.empty(1, 16, 2, 7, device="cuda", dtype=torch.bfloat16),
+        values=torch.empty(1, 16, 2, 7, device="cuda", dtype=torch.bfloat16))])
+        for _ in range(owners))
+    session._context_copy_plan = session._bind_context_copy_plan()
+    session._staging_launch_plan = None
+    session._staging_implementation = None
+    report = session.dispatch_report
+    assert report["context_copy"]["implementation"] == "packed"
+    assert report["context_copy"]["fallback_reason"] is None
+    assert len(report["context_copy"]["launch_plan"]["ranges"]) == 1
+
+
+@pytest.mark.parametrize("missing_plan", [True, False])
+def test_context_commit_native_failure_never_copies_or_advances(monkeypatch, missing_plan):
+    from types import SimpleNamespace
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    session = object.__new__(DFlashDraftGraphSession)
+    session.lengths = (3, 4)
+    session.caches = (SimpleNamespace(length=3), SimpleNamespace(length=4))
+    def forbidden(*args, **kwargs):
+        pytest.fail("PyTorch copy fallback executed")
+    def native_failure(*args):
+        raise RuntimeError("injected native copy failure")
+    monkeypatch.setattr(torch, "_foreach_copy_", forbidden)
+    session._context_copy_plan = None if missing_plan else SimpleNamespace(run=native_failure)
+    with pytest.raises(RuntimeError, match="bound native copy plan|injected native copy failure"):
+        session._commit_context((1, 2))
+    assert session.lengths == (3, 4)
+    assert tuple(cache.length for cache in session.caches) == (3, 4)
+
+
+def test_noncontiguous_context_binding_rejected_before_native_allocation(monkeypatch):
+    from types import SimpleNamespace
+    from kestrel.models.qwen35.draft_workspace import DFlashDraftGraphSession
+    from kestrel_kernels import draft_context_copy
+    session = object.__new__(DFlashDraftGraphSession)
+    contiguous = torch.empty(1, 8, 2, 4)
+    strided = torch.empty(1, 8, 2, 5)[..., :4]
+    session.workspaces = [SimpleNamespace(keys=contiguous, values=contiguous)]
+    session.caches = [SimpleNamespace(layers=[SimpleNamespace(keys=strided, values=strided)])]
+    monkeypatch.setattr(draft_context_copy, "DraftContextCopyPlan", lambda *a, **kw: pytest.fail("native allocation before validation"))
+    with pytest.raises(ValueError, match="contiguous cache storage.*fallback is disabled"):
+        session._bind_context_copy_plan()
+
+
+@pytest.mark.parametrize("operation", ["construct", "rebind"])
+def test_strided_cache_rejected_before_workspace_mutation(monkeypatch, operation):
+    from types import SimpleNamespace
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from kestrel.models.qwen35 import draft_workspace as module
+    session_type = module.DFlashDraftGraphSession
+    with FakeTensorMode():
+        parameter = torch.empty(1, device="cuda")
+        strided = torch.empty_strided((1, 8, 2, 4), (80, 10, 5, 1), device="cuda")
+        cache = SimpleNamespace(capacity=8, length=2,
+                                layers=[SimpleNamespace(keys=strided, values=strided)])
+        config = SimpleNamespace(block_size=4, num_key_value_heads=2, head_dim=4)
+        model = SimpleNamespace(config=config, layers=[None], parameters=lambda: iter([parameter]))
+        monkeypatch.setattr(module, "DraftLayerKVWorkspace", lambda **kw: pytest.fail("allocated before validation"))
+        if operation == "construct":
+            invoke = lambda: session_type(model, [cache])
+        else:
+            session = object.__new__(session_type)
+            session.failed = session.closed = session.active = False
+            old_cache = SimpleNamespace(length=1)
+            session.caches = (old_cache,)
+            session.lengths = (1,)
+            original_plan = object()
+            session._context_copy_plan = original_plan
+            session.workspaces = [SimpleNamespace(capacity=8, keys=torch.empty(1, 8, 2, 4, device="cuda"))]
+            # No stream exists: reaching stream synchronization or writes is a failure.
+            invoke = lambda: session.rebind([cache])
+        with pytest.raises(ValueError, match="contiguous cache storage.*stride=.*fallback is disabled"):
+            invoke()
+        if operation == "rebind":
+            assert session.caches == (old_cache,)
+            assert session.lengths == (1,)
+            assert session._context_copy_plan is original_plan

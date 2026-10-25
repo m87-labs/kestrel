@@ -76,6 +76,45 @@ class Qwen3_5TextConfig:
             tuple(int(value) for value in self.mrope_section),
         )
 
+    def retained_prefix_demand(self, *, capacity: int, verification_width: int,
+                               input_dtype: str = "bf16"):
+        """Declare verification/commit semantics independently of kernel inventory.
+
+        This is one requirement of the model, not a whole-model coverage proof.
+        Admission must cover every active cohort, including retirement sizes that
+        are not scheduler capacity buckets. The width includes the bonus token,
+        so every committed prefix has at least one token.
+        """
+        from kestrel_kernels.native_coverage import KernelDemand
+
+        for name, value in (("capacity", capacity), ("verification_width", verification_width)):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if "linear_attention" not in self.layer_types:
+            raise ValueError("model has no retained recurrent prefix requirement")
+        return KernelDemand(
+            op_kind="gated_delta.retained_prefix",
+            input_dtype=input_dtype,
+            layout="packed_uniform_sequences",
+            dimensions={
+                "num_k_heads": self.linear_num_key_heads,
+                "num_v_heads": self.linear_num_value_heads,
+                "key_head_dim": self.linear_key_head_dim,
+                "value_head_dim": self.linear_value_head_dim,
+                "verification_width": verification_width,
+            },
+            semantics={
+                "initial_state": True,
+                "preserve_initial_state": True,
+                "commit": "per_sequence_accepted_prefix",
+                "graph_capture": True,
+            },
+            dynamic_bounds={
+                "sequences": (1, capacity),
+                "accepted_length": (1, verification_width),
+            },
+        )
+
     @classmethod
     def from_dict(
         cls,

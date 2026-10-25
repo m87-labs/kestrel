@@ -11,6 +11,11 @@ from kestrel.runtime.tokens import TextToken
 
 def decoder():
     obj = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
+    obj._width_policy = None
+    obj._batch_width_policies = {}
+    obj._batch_span_verifiers = {}
+    obj._batch_draft_confidence = {}
+    obj._draft_graph = None
     obj._target_graph = None
     obj._replay_graph = None
     obj._draft_graph = None
@@ -22,6 +27,7 @@ def decoder():
     obj._commit_pending = False
     obj._generated_verification = None
     obj._verification_layouts = {}
+    obj._candidate_buffers = {}
     state = SimpleNamespace(batch_idx=1, max_length=100, length=10)
     erased = []
     obj.runtime = SimpleNamespace(page_table=SimpleNamespace(
@@ -62,6 +68,36 @@ def test_bonus_not_duplicated_and_caps_commit_matching_input_prefix(cap, expecte
     assert state.length == 10  # Scheduler advances this exactly once.
 
 
+@pytest.mark.parametrize("cap,expected", [(None, [8, 9, 99]), (1, [8]), (2, [8, 9])])
+def test_generated_step_keeps_proposals_on_device_until_verification(cap, expected, monkeypatch):
+    # Keep this ownership/protocol test CPU-only; the CUDA primitive has its own
+    # exhaustive rounding and retained-buffer tests in kestrel-kernels.
+    import sys
+
+    def stage_candidate(proposed, candidate, bonus):
+        candidate[0] = bonus
+        candidate[1:].copy_(proposed)
+
+    monkeypatch.setitem(sys.modules, "kestrel_kernels.verification_pointwise",
+                        SimpleNamespace(stage_candidate=stage_candidate))
+    obj, state, _, _ = decoder()
+    committed, verified_inputs = [], []
+    obj._generated_verification = SimpleNamespace(commit=committed.append)
+    original = obj._target
+
+    def verify(tokens, *args, **kwargs):
+        assert isinstance(tokens, torch.Tensor)
+        verified_inputs.append(tokens.clone())
+        return original(tokens, *args, **kwargs)
+
+    obj._target = verify
+    result = obj.step([state], commit_caps=[cap])
+    assert torch.equal(verified_inputs[0], torch.tensor([7, 8, 9, 10]))
+    assert result.tokens == [expected]
+    assert result.accept_counts == [len(expected) - 1]
+    assert len(committed) == 1 and committed[0][-1] == len(expected)
+
+
 def test_retire_releases_slot_and_capture_once():
     obj, state, _, erased = decoder()
     obj.retire(state)
@@ -95,6 +131,8 @@ def test_shutdown_releases_replay_graph_after_target_shutdown_error():
 def test_single_draft_device_ids_are_ordered_after_stream_lease():
     from contextlib import contextmanager
     obj = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
+    obj._width_policy = None
+    obj._draft_graph = None
     obj.draft = SimpleNamespace(config=SimpleNamespace(block_size=4, mask_token_id=0))
     obj.runtime = SimpleNamespace(device=torch.device("cuda:0"), model=SimpleNamespace(
         lm_head=lambda hidden: torch.cat((hidden, hidden + 1), dim=-1)))
@@ -565,3 +603,228 @@ def test_unsupported_runtime_rejects_draft_config_before_loading():
     with pytest.raises(ValueError, match="requires a Qwen"):
         RuntimeConfig(model="moondream3-preview", draft_model_path="unused",
                       model_path="unused", max_batch_size=1)
+
+
+@pytest.mark.parametrize("last_token_only,rows", [(True, 1), (False, 16)])
+def test_eager_prefill_scores_only_final_token_without_trimming_features(last_token_only, rows):
+    obj, _, _, _ = decoder()
+    hidden = torch.randn(1, 16, 4)
+    features = (torch.randn(1, 16, 4),)
+    output = SimpleNamespace(last_hidden_state=hidden, layer_hidden_states=features)
+    obj.text = lambda **kwargs: output
+    calls = []
+
+    def head(value):
+        calls.append(value.shape[1])
+        return value
+
+    obj.runtime.model = SimpleNamespace(lm_head=head)
+    result, predictions = obj._verify(None, last_token_only=last_token_only)
+    assert result is output
+    assert result.layer_hidden_states is features
+    assert calls == [rows]
+    torch.testing.assert_close(
+        predictions, hidden[:, -1:].argmax(-1) if last_token_only else hidden.argmax(-1),
+    )
+
+
+@pytest.mark.parametrize('count', [1, 2, 3, 4])
+@pytest.mark.parametrize('batched', [False, True])
+def test_confidence_matches_active_draft_geometry(count, batched):
+    obj, _, _, _ = decoder()
+    confidence = torch.empty(1, 3)
+    obj._draft_confidence = confidence
+    batch_confidence = torch.empty(count, 3)
+    if batched and count in (2, 4):
+        obj._batch_draft_confidence[count] = batch_confidence
+    obj.runtime.model = SimpleNamespace(lm_head=object())
+    calls = []
+
+    class Draft:
+        config = SimpleNamespace(block_size=4)
+
+        def __call__(self, noise, features, positions, **kwargs):
+            return noise
+
+        def forward_many(self, noise, features, positions, **kwargs):
+            return noise
+
+        def select_tokens(self, hidden, head, anchors, **kwargs):
+            calls.append(kwargs)
+            return torch.zeros(count, 3, dtype=torch.int32)
+
+    obj.draft = Draft()
+    noise = [torch.ones(1, 4, 2) for _ in range(count)]
+    with obj._draft_tokens(noise, noise, noise, [object() for _ in range(count)]):
+        pass
+    assert len(calls) == 1
+    if count == 1:
+        assert calls[0]['confidence'] is confidence
+    elif batched and count in (2, 4):
+        assert calls[0]['confidence'] is batch_confidence
+    else:
+        assert calls[0] == {}
+
+
+def test_batched_calibration_preserves_sequence_geometry_and_selected_span():
+    from kestrel.models.qwen35.verification_policy import VerificationWidthPolicy
+
+    obj, _, _, _ = decoder()
+    obj.runtime.device = torch.device('cpu')
+    policy = VerificationWidthPolicy((2, 4, 8))
+    obj._batch_width_policies = {2: policy}
+    measured, selected = [], []
+
+    class Verifier:
+        def __init__(self, width):
+            self.block = width
+        def measure_replay(self, tokens, committed, slots):
+            assert tokens.shape == (2, self.block)
+            assert slots == [1, 2]
+            measured.append(self.block)
+            return float(self.block)
+        def target_many(self, candidates, committed, slots):
+            assert all(len(row) == self.block for row in candidates)
+            selected.append(self.block)
+            return candidates
+
+    verifiers = {width: Verifier(width) for width in policy.widths}
+    obj._batch_span_verifiers = {2: verifiers}
+    obj._generated_verifiers = {2: verifiers[8]}
+    obj._generated_verification = verifiers[8]
+    sessions = [SimpleNamespace(cache=object(), state=SimpleNamespace(batch_idx=slot))
+                for slot in (1, 2)]
+    Qwen35DFlashDecoder._target_many(obj, [list(range(8))] * 2, sessions)
+    assert policy.calibrated
+    assert {width: measured.count(width) for width in policy.widths} == {2: 5, 4: 5, 8: 5}
+    Qwen35DFlashDecoder._target_many(obj, [list(range(4))] * 2, sessions)
+    assert selected == [8, 4]
+    assert len(measured) == 15
+
+
+@pytest.mark.parametrize('count', [1, 3, 5, 8])
+@pytest.mark.parametrize('learned_selector', [False, True])
+def test_fixed_verifier_projects_only_consumed_proposals(count, learned_selector):
+    obj, _, _, _ = decoder()
+    obj._generated_verification = object()
+    obj._generated_verifiers = {count: SimpleNamespace(block=2)}
+    obj.runtime.model = SimpleNamespace(lm_head=object())
+    hidden = torch.arange(count * 16 * 2).reshape(count, 16, 2)
+    projected = []
+    class Draft:
+        candidate_selector = object() if learned_selector else None
+        config = SimpleNamespace(block_size=16)
+        def __call__(self, *args, **kwargs):
+            return hidden
+        def forward_many(self, *args, **kwargs):
+            return hidden.split(1)
+        def select_tokens(self, value, *args):
+            projected.append(value.clone())
+            return value[:, 1:, 0]
+    obj.draft = Draft()
+    inputs = list(hidden.split(1))
+    with obj._draft_tokens(inputs, inputs, inputs, [object() for _ in range(count)]) as result:
+        expected_rows = 16 if learned_selector else 2
+        assert torch.equal(result, hidden[:, 1:expected_rows, 0])
+    assert torch.equal(projected[0], hidden[:, :expected_rows])
+
+
+@pytest.mark.parametrize("verification,decode,supported,generated", [
+    ("native", "generated", True, False),
+    ("native", "auto", True, False),
+    ("generated", "auto", False, True),
+    ("auto", "generated", False, True),
+    ("auto", "auto", True, True),
+    ("auto", "auto", False, False),
+])
+def test_verification_backend_is_independent(monkeypatch, verification, decode, supported, generated):
+    import kestrel.models.qwen35.spec_decoder as module
+    import kestrel.models.qwen35.generated_verification as generated_module
+    draft = SimpleNamespace(config=SimpleNamespace(hidden_size=4, target_layer_ids=(0,),
+        mask_token_id=0, vocab_size=16, selector_rank=0, block_size=4))
+    text = SimpleNamespace(config=SimpleNamespace(hidden_size=4, num_hidden_layers=1,
+                                                  vocab_size=16), modules=lambda: ())
+    runtime = SimpleNamespace(device=torch.device("cuda"), dtype=torch.bfloat16,
+        model=SimpleNamespace(model=SimpleNamespace(language_model=text), lm_head=None),
+        _cfg=SimpleNamespace(enable_cuda_graphs=False, verification_path=verification, verification_projection_path="canonical", verification_attention_splits=None, verification_attention_implementation="simt"),
+        decode_path=decode, max_batch_size=1)
+    monkeypatch.setattr(module, "load_dflash_drafter", lambda *a, **k: draft)
+    from kestrel.models.qwen35 import verification_linear
+    monkeypatch.setattr(verification_linear, "NativeVerificationProjections", lambda modules, **kwargs: object())
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **k: object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda **k: object())
+    calls=[]
+    class Verifier:
+        segmented=False
+        @staticmethod
+        def supports(*args):
+            calls.append("supports")
+            return supported
+        def __init__(self, *args):
+            calls.append("construct")
+    monkeypatch.setattr(generated_module, "Qwen35GeneratedVerification", Verifier)
+    result = Qwen35DFlashDecoder(runtime, "draft")
+    assert (result._generated_verification is not None) is generated
+    assert runtime.decode_path == decode
+    if verification == "native":
+        assert calls == []  # Explicit native never resolves generated artifacts.
+
+
+def test_target_graph_cannot_capture_outside_verification_scope():
+    obj,_,_,_=decoder()
+    obj._target_graph=object()
+    with pytest.raises(ValueError,match='explicit verification scope'):
+        obj._verify(object(),verification=False)
+
+
+@pytest.mark.parametrize('width', [None, 1, 2, 3, 8, 16])
+def test_explicit_native_prefix_cap_preserves_draft_and_anchor(width):
+    from kestrel.runtime.spec import DraftResult
+    obj = Qwen35DFlashDecoder.__new__(Qwen35DFlashDecoder)
+    obj._width_policy = None
+    obj._native_verification_width = width
+    proposed = torch.arange(15).reshape(1,15)
+    obj._propose_fixed = lambda ctx: DraftResult(token_ids=proposed)
+    result = obj.propose(None)
+    count = 15 if width is None else width - 1
+    assert torch.equal(result.token_ids, proposed[:, :count])
+    assert torch.equal(proposed, torch.arange(15).reshape(1,15))
+
+
+@pytest.mark.parametrize('width,path', [(0,'native'),(-1,'native'),(True,'native'),
+    (1.5,'native'),(8,'auto'),(8,'generated')])
+def test_native_width_config_rejects_invalid_cap_before_device_setup(width,path):
+    from kestrel.config import RuntimeConfig
+    with pytest.raises(ValueError, match='verification_width'):
+        RuntimeConfig(model='unused', verification_path=path, verification_width=width)
+
+
+@pytest.mark.parametrize('width', [1, 2, 3])
+def test_native_prefix_cap_applies_to_every_batched_candidate(width):
+    obj, first, commits, _ = decoder()
+    second = add_session(obj)
+    obj._native_verification_width = width
+    seen = []
+    target = obj._target_many
+    def verify(candidates, sessions, *, leases=None):
+        seen.extend(candidates)
+        return target(candidates, sessions, leases=leases)
+    obj._target_many = verify
+    result = obj.step([second, first])
+    assert len(seen) == 2 and all(len(row) == width for row in seen)
+    assert [row[0] for row in seen] == [17, 7]
+    assert all(len(row) <= width for row in result.tokens)
+    assert all(count <= width for count in commits)
+
+
+def test_native_prefix_cap_cannot_exceed_loaded_draft_block(monkeypatch):
+    import kestrel.models.qwen35.spec_decoder as module
+    text = SimpleNamespace(config=SimpleNamespace(hidden_size=4, num_hidden_layers=1, vocab_size=16))
+    draft = SimpleNamespace(config=SimpleNamespace(hidden_size=4, target_layer_ids=(0,),
+        mask_token_id=0, vocab_size=16, selector_rank=0, block_size=4))
+    runtime = SimpleNamespace(model=SimpleNamespace(model=SimpleNamespace(language_model=text)),
+        device=torch.device('cuda'), dtype=torch.bfloat16,
+        _cfg=SimpleNamespace(verification_path='native',verification_projection_path='canonical', verification_width=5))
+    monkeypatch.setattr(module, 'load_dflash_drafter', lambda *args, **kwargs: draft)
+    with pytest.raises(ValueError, match='fit the draft block'):
+        module.Qwen35DFlashDecoder(runtime, 'draft')

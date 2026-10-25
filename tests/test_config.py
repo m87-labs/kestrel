@@ -158,3 +158,61 @@ def test_runtime_config_allows_cuda_minor_compatibility_in_message(
     assert "Installed PyTorch is built for CUDA 12.8" in msg
     assert "driver reports CUDA 12.4 support" in msg
     assert "newer than the installed NVIDIA driver supports" not in msg
+
+
+def test_verification_path_is_independent_of_decode_path():
+    cfg = RuntimeConfig(model_path="/weights", device="cpu",
+                        decode_path="generated", verification_path="native")
+    assert cfg.decode_path == "generated"
+    assert cfg.verification_path == "native"
+
+
+def test_verification_path_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="verification_path"):
+        RuntimeConfig(model_path="/weights", verification_path="triton")
+
+
+@pytest.mark.parametrize("splits", [0, 3, True, "8"])
+def test_verification_attention_rejects_invalid_explicit_splits(splits):
+    with pytest.raises(ValueError, match="verification attention splits"):
+        RuntimeConfig(model_path="/weights", verification_path="native", verification_attention_splits=splits)
+
+
+def test_verification_attention_requires_native_opt_in():
+    with pytest.raises(ValueError, match="explicit native"):
+        RuntimeConfig(model_path="/weights", verification_attention_splits=8)
+    assert RuntimeConfig(model_path="/weights", verification_path="native", verification_attention_splits=8).verification_attention_splits == 8
+
+
+@pytest.mark.parametrize('implementation,splits', [('unknown',8),('packed_mma',None),('packed_mma',1)])
+def test_verification_attention_rejects_unsupported_implementation(implementation,splits):
+    with pytest.raises(ValueError):
+        RuntimeConfig(model_path='/weights',verification_path='native',verification_attention_splits=splits,
+                      verification_attention_implementation=implementation)
+
+
+@pytest.mark.parametrize('path', ['auto', 'generated', 'unknown', None])
+def test_verification_projection_path_rejects_unknown_component(path):
+    with pytest.raises(ValueError, match='verification_projection_path'):
+        RuntimeConfig(model_path='/weights', device='cpu', verification_projection_path=path)
+
+
+@pytest.mark.parametrize('backend', ['auto', 'generated'])
+def test_default_verification_projection_requires_explicit_native(backend):
+    with pytest.raises(ValueError, match='explicit native'):
+        RuntimeConfig(model_path='/weights', device='cpu', verification_path=backend,
+                      verification_projection_path='default')
+
+
+def test_attention_can_retain_default_projection_math():
+    cfg=RuntimeConfig(model_path='/weights',device='cpu',verification_path='native',
+        verification_projection_path='default',verification_attention_splits=8,
+        verification_attention_implementation='packed_mma')
+    assert cfg.verification_projection_path == 'default'
+    assert RuntimeConfig(model_path='/weights',device='cpu').verification_projection_path == 'canonical'
+
+
+def test_default_verification_projection_requires_attention_component():
+    with pytest.raises(ValueError, match="explicit attention splits"):
+        RuntimeConfig(model_path="/weights",device="cpu",verification_path="native",
+                      verification_projection_path="default")

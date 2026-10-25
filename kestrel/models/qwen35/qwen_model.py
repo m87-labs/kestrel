@@ -26,6 +26,9 @@ from kestrel.ops.attention import dense_attention, paged_attention
 from kestrel.ops.block_scaled_linear import BlockScaledLinear
 from kestrel.ops.rotary import default_inv_freq
 
+from .verification_linear import VerificationLinear, VerificationProjection, VerificationExperts
+from .verification_attention import VerificationAttention
+
 from .qwen_config import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from .cache import Qwen35InferenceCache
 from .gdn_state import LinearAttentionState
@@ -199,7 +202,7 @@ def _text_linear(
             in_features, out_features, quantized_rows=quantized_rows,
             interleaved_parts=interleaved_parts,
         )
-    return nn.Linear(in_features, out_features, bias=False)
+    return VerificationLinear(in_features, out_features, bias=False)
 
 
 def _rmsnorm_state(dim: int, eps: float) -> nn.ModuleDict:
@@ -668,7 +671,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return output
 
 
-class Qwen3_5Attention(nn.Module):
+class Qwen3_5Attention(nn.Module, VerificationAttention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
@@ -701,6 +704,7 @@ class Qwen3_5Attention(nn.Module):
         paged_kv_seqlens_q: torch.Tensor | None = None,
         paged_kv_seqlens_k: torch.Tensor | None = None,
         cu_seq_lens_q: torch.Tensor | None = None,
+        sequence_lengths: Sequence[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -770,15 +774,19 @@ class Qwen3_5Attention(nn.Module):
                     cu_seqlens=cu_seq_lens_q,
                 )
             else:
-                attn_output = paged_attention(
-                    query_states,
-                    paged_kv_layer=paged_kv_layer,
-                    page_table=page_table,
-                    paged_kv_seqlens_q=paged_kv_seqlens_q,
-                    paged_kv_seqlens_k=paged_kv_seqlens_k,
-                    cu_seqlens_q=cu_seq_lens_q,
-                    scaling=self.scaling,
-                )
+                attn_output = self.verification_attention(query_states,
+                    cache=past_key_values, paged_kv_layer=paged_kv_layer, page_table=page_table,
+                    used_k=paged_kv_seqlens_k, sequence_lengths=sequence_lengths, scaling=self.scaling)
+                if attn_output is None:
+                    attn_output = paged_attention(
+                        query_states,
+                        paged_kv_layer=paged_kv_layer,
+                        page_table=page_table,
+                        paged_kv_seqlens_q=paged_kv_seqlens_q,
+                        paged_kv_seqlens_k=paged_kv_seqlens_k,
+                        cu_seqlens_q=cu_seq_lens_q,
+                        scaling=self.scaling,
+                    )
             attn_weights = None
 
         attn_output = attn_output * torch.sigmoid(gate)
@@ -822,7 +830,7 @@ class Qwen3_5MLP(nn.Module):
         return self.down_proj(hidden)
 
 
-class Qwen3_5Experts(nn.Module):
+class Qwen3_5Experts(nn.Module, VerificationExperts):
     """Packed Qwen 3.5 MoE expert weights, matching HF safetensor keys."""
 
     def __init__(self, config: Qwen3_5TextConfig):
@@ -886,6 +894,18 @@ class Qwen3_5Experts(nn.Module):
                     dtype=torch.float32,
                 ),
             )
+    def verification_moe_spec(self, dtype=None):
+        return _MOE_API.MoeSpec(
+            num_experts=self.num_experts,
+            top_k=int(self.top_k),
+            hidden_size=self.hidden_dim,
+            intermediate_size=self.intermediate_dim,
+            activation="swiglu",
+            weight_format=self.expert_weight_format,
+            dtype=self.gate_up_proj.dtype if dtype is None else dtype,
+            backend="auto",
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -907,30 +927,27 @@ class Qwen3_5Experts(nn.Module):
         tokens = int(hidden_states.shape[0])
         if top_k_index.dtype != torch.int32:
             top_k_index = top_k_index.to(torch.int32)
-        spec = _MOE_API.MoeSpec(
-            num_experts=self.num_experts,
-            top_k=int(self.top_k),
-            hidden_size=self.hidden_dim,
-            intermediate_size=self.intermediate_dim,
-            activation="swiglu",
-            weight_format=self.expert_weight_format,
-            dtype=hidden_states.dtype,
-            backend="auto",
-        )
+        spec = self.verification_moe_spec(hidden_states.dtype)
         moe_runtime = get_runtime(hidden_states.device).moe
-        handle = moe_runtime.prepare(
-            spec,
-            _MOE_API.MoeCapacity(
-                max_tokens=tokens,
-                mode=(
-                    "decode"
-                    if tokens <= _KESTREL_MOE_DECODE_MAX_TOKENS
-                    else "prefill"
+        handle = self.verification_moe_handle(spec, hidden_states.device)
+        if handle is None:
+            handle = moe_runtime.prepare(
+                spec,
+                _MOE_API.MoeCapacity(
+                    max_tokens=tokens,
+                    mode=(
+                        "decode"
+                        if tokens <= _KESTREL_MOE_DECODE_MAX_TOKENS
+                        else "prefill"
+                    ),
                 ),
-            ),
-            device=hidden_states.device,
-        )
-        pack_kwargs: dict[str, Any] = {}
+                device=hidden_states.device,
+            )
+        # Checkpoint loading interleaves gate/up rows for both BF16 and FP8.
+        # Single-token BF16 dispatch validates this tag before warpgemv launch.
+        pack_kwargs: dict[str, Any] = {
+            "weight_scale_layout": _KESTREL_MOE_FP8_WEIGHT_SCALE_LAYOUT,
+        }
         if self.expert_weight_format == "fp8_e4m3":
             pack_kwargs = {
                 "up_scale": self.gate_up_proj_scale,
@@ -952,7 +969,7 @@ class Qwen3_5Experts(nn.Module):
         )
 
 
-class Qwen3_5TopKRouter(nn.Module):
+class Qwen3_5TopKRouter(nn.Module, VerificationProjection):
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
         if config.num_experts is None or config.num_experts_per_tok is None:
@@ -964,7 +981,7 @@ class Qwen3_5TopKRouter(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = F.linear(hidden_states, self.weight)
+        router_logits = self.project(hidden_states)
         return get_runtime(router_logits.device).moe.topk_fwd(
             router_logits,
             self.top_k,
@@ -983,7 +1000,7 @@ class Qwen3_5SparseMoeBlock(nn.Module):
             config,
             intermediate_size=config.shared_expert_intermediate_size,
         )
-        self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
+        self.shared_expert_gate = VerificationLinear(config.hidden_size, 1, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -1101,6 +1118,7 @@ class Qwen3_5DecoderLayer(nn.Module):
                 paged_kv_seqlens_q=paged_kv_seqlens_q,
                 paged_kv_seqlens_k=paged_kv_seqlens_k,
                 cu_seq_lens_q=cu_seq_lens_q,
+                sequence_lengths=sequence_lengths,
             )
 
         # Fully Connected
@@ -1636,7 +1654,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.model = Qwen3_5Model(config)
-        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
+        self.lm_head = VerificationLinear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
 __all__ = [
     "Qwen3_5VisionModel",

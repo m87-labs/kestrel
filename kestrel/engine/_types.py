@@ -109,11 +109,22 @@ class EngineStream(AsyncIterator[StreamUpdate]):
                 self._closed = True
                 if item.error is not None:
                     self._error = item.error
+                    # Iteration delivered the failure. Observe its duplicate
+                    # result-channel exception even if result() is never called.
+                    if self._result_future.done():
+                        self._observe_result_error(self._result_future)
+                    else:
+                        self._result_future.add_done_callback(self._observe_result_error)
                     raise item.error
                 if item.result is not None:
                     self._final_result = item.result
                 raise StopAsyncIteration
             return item
+
+    @staticmethod
+    def _observe_result_error(future):
+        if not future.cancelled():
+            future.exception()
 
     async def result(self) -> EngineResult:
         if self._final_result is not None:
@@ -436,6 +447,7 @@ class _AutoregressiveRequest:
     return_logprobs: Optional[bool] = None
     generated_prefix: GeneratedPrefix = field(default_factory=GeneratedPrefix)
     suppress_next_token_ids: Optional[tuple[int, ...]] = None
+    ignore_eos: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
