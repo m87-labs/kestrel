@@ -1,5 +1,6 @@
 """Independent greedy DFlash sessions with automatic target verification."""
 
+from functools import partial
 from dataclasses import dataclass, replace
 from contextlib import ExitStack, contextmanager, nullcontext
 from collections import Counter, OrderedDict
@@ -736,7 +737,9 @@ class Qwen35DFlashDecoder:
                     committed = Qwen35InferenceCache.commit_recurrent_prefixes(
                         [ctx[1] for ctx in pending], [ctx[4] for ctx in pending],
                         finalizer=(None if self._target_graph is None
-                                   else self._target_graph.finalize_prefixes),
+                                   else partial(self._target_graph.finalize_prefixes, include_histories=False)),
+                        history_writer=(None if self._target_graph is None
+                                        else self._target_graph.write_histories),
                         _destinations=[session.spare_cache for session, _ in sessions])
                 for (session, _, features, expected, count), cache in zip(pending, committed):
                     session.spare_cache = session.cache
