@@ -352,7 +352,12 @@ class Qwen35DFlashDecoder:
             cache = committed.fork_recurrent_state(capture_prefix=capture)
         device = self.runtime.device
         start, length = committed.seq_length, len(tokens)
-        ids = torch.tensor([tokens], device=device, dtype=torch.long)
+        if isinstance(tokens, torch.Tensor):
+            if tokens.ndim != 1 or tokens.dtype != torch.long or tokens.device != device:
+                raise ValueError("verification candidates require device-local int64 tokens")
+            ids = tokens.unsqueeze(0)
+        else:
+            ids = torch.tensor([tokens], device=device, dtype=torch.long)
         from .query_metadata import build_query_metadata
         metadata = build_query_metadata(self, (length,), (slot,), (start,)) if capture else None
         if metadata is None:
@@ -517,9 +522,6 @@ class Qwen35DFlashDecoder:
                         target_positions=[session.cache.seq_length for session in sessions]) as tokens:
                     if policy is not None:
                         end.record()
-                # Queue context copies before the blocking host transfer. Keep
-                # the owner pinned and the output tensor live through the read.
-                ids = tokens.tolist()
         else:
             noise = torch.full((count, config.block_size), config.mask_token_id,
                                device=self.runtime.device, dtype=torch.long)
@@ -534,8 +536,6 @@ class Qwen35DFlashDecoder:
                     positions, [session.draft_cache for session in sessions], noise[:, 0]) as tokens:
                 if policy is not None:
                     end.record()
-            # The returned tensor owns its storage after the serialized lease.
-            ids = tokens.tolist()
         if policy is not None:
             confidence = self._batch_draft_confidence[count].flatten().tolist()
             if warmed:
@@ -544,7 +544,13 @@ class Qwen35DFlashDecoder:
         else:
             width = (self._generated_verifiers[count].block
                      if self._generated_verification is not None else config.block_size)
-        return [[session.bonus, *row[:width - 1]] for session, row in zip(sessions, ids)]
+        if (tokens.ndim != 2 or tokens.shape[0] != count
+                or tokens.shape[1] < width - 1 or tokens.dtype != torch.long):
+            raise ValueError("draft proposals require complete int64 token rows")
+        anchors = tokens.new_tensor([[session.bonus] for session in sessions])
+        # Verification can consume these IDs before acceptance reads them on
+        # the host. The new allocation also detaches them from draft graph I/O.
+        return torch.cat((anchors, tokens[:, :width - 1]), dim=1)
 
     def _target_many(self, candidates, sessions, *, leases=None):
         if self._generated_verification is not None:
@@ -558,7 +564,8 @@ class Qwen35DFlashDecoder:
                 if not policy.calibrated:
                     if any(len(row) != policy.widths[-1] for row in candidates):
                         raise ValueError("batched calibration requires complete maximum-span proposals")
-                    tokens = torch.tensor(candidates, device=self.runtime.device, dtype=torch.long)
+                    tokens = (candidates if isinstance(candidates, torch.Tensor) else
+                              torch.tensor(candidates, device=self.runtime.device, dtype=torch.long))
                     samples = {width: [] for width in policy.widths}
                     for repeat in range(5):
                         for width in policy.widths[::1 if repeat % 2 == 0 else -1]:
@@ -580,7 +587,13 @@ class Qwen35DFlashDecoder:
         graph_staging = leases is not None and self._target_graph is not None
         packed, branches = Qwen35InferenceCache.fork_packed_recurrent_state(
             sources, materialize=not graph_staging)
-        ids = torch.tensor([sum(candidates, [])], device=device, dtype=torch.long)
+        if isinstance(candidates, torch.Tensor):
+            if (candidates.ndim != 2 or candidates.shape[0] != len(sessions)
+                    or candidates.dtype != torch.long or candidates.device != device):
+                raise ValueError("verification candidates require device-local int64 token rows")
+            ids = candidates.reshape(1, -1)
+        else:
+            ids = torch.tensor([sum(candidates, [])], device=device, dtype=torch.long)
         from .query_metadata import build_query_metadata
         metadata = build_query_metadata(self, lengths,
             [session.state.batch_idx for session in sessions],
@@ -712,15 +725,19 @@ class Qwen35DFlashDecoder:
                         session.state.batch_idx, capture=True, leases=leases)]
                     candidates = [candidate.tolist()]
                 else:
-                    candidates = [[session.bonus, *proposed.tolist()]]
-                    results = [self._target(candidates[0], session.cache,
+                    candidate = torch.cat((proposed.new_tensor([session.bonus]), proposed))
+                    results = [self._target(candidate, session.cache,
                         session.state.batch_idx, capture=True, leases=leases)]
+                    candidates = [candidate.tolist()]
             else:
                 candidates = self._propose_many([session for session, _ in sessions])
                 width = getattr(self, '_native_verification_width', None)
                 if width is not None:
-                    candidates = [candidate[:width] for candidate in candidates]
+                    candidates = (candidates[:, :width] if isinstance(candidates, torch.Tensor) else
+                                  [candidate[:width] for candidate in candidates])
                 results = self._target_many(candidates, [session for session, _ in sessions], leases=leases)
+                if isinstance(candidates, torch.Tensor):
+                    candidates = candidates.tolist()
             for (session, cap), candidate, (expected, features, verified) in zip(sessions, candidates, results):
                 accepted = 0
                 for proposed, wanted in zip(candidate[1:], expected):
