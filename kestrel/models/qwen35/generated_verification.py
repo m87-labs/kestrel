@@ -388,6 +388,8 @@ def validate_verification_capabilities(runtime, target_config):
     from importlib import import_module
     from types import SimpleNamespace
 
+    validate_fp8_projection_coverage(runtime, target_config)
+
     path = runtime._cfg.verification_path
     if path == "auto":
         path = runtime.decode_path
@@ -432,3 +434,22 @@ def validate_verification_capabilities(runtime, target_config):
             + "; ".join(missing)
             + ". Install a compatible kestrel-kernels build with CuTe DSL implementations; "
             "backend fallback is disabled.")
+
+
+def validate_fp8_projection_coverage(runtime, target_config):
+    """Preflight SM90's native FP8 projection route before model construction.
+
+    Other architecture providers retain their existing admission; this is not
+    a whole-model kernel or numerical qualification claim.
+    """
+    if getattr(target_config, "dense_weight_format", "bf16") != "fp8_e4m3" or runtime.device.type != "cuda":
+        return
+    if torch.cuda.get_device_capability(runtime.device) != (9, 0):
+        return
+    if runtime.dtype != torch.bfloat16:
+        raise RuntimeError("Hopper FP8 projections require BF16 activations")
+    from kestrel_kernels.block_scaled_coverage import require_hopper_projection_coverage
+    return require_hopper_projection_coverage(
+        target_config.block_scaled_projections(),
+        max_rows=runtime.max_batch_size * target_config.max_position_embeddings,
+        num_sms=torch.cuda.get_device_properties(runtime.device).multi_processor_count)

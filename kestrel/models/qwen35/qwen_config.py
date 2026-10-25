@@ -76,6 +76,32 @@ class Qwen3_5TextConfig:
             tuple(int(value) for value in self.mrope_section),
         )
 
+    def block_scaled_projections(self):
+        """Declare stored FP8 dense projections from model geometry, not inventory."""
+        if self.dense_weight_format != "fp8_e4m3":
+            return ()
+        from kestrel_kernels.block_scaled_coverage import BlockScaledProjection
+
+        rows = []
+        if "linear_attention" in self.layer_types:
+            value = self.linear_num_value_heads * self.linear_value_head_dim
+            conv = 2 * self.linear_num_key_heads * self.linear_key_head_dim + value
+            # The a/b suffix remains separately stored BF16; N describes only
+            # the FP8 prefix, exactly as BlockScaledLinear.quantized_rows does.
+            rows.extend((BlockScaledProjection("recurrent.in", conv + value, self.hidden_size),
+                         BlockScaledProjection("recurrent.out", self.hidden_size, value)))
+        if "full_attention" in self.layer_types:
+            query = self.num_attention_heads * self.head_dim
+            kv = self.num_key_value_heads * self.head_dim
+            rows.extend((BlockScaledProjection("attention.qkv", 2 * query + 2 * kv, self.hidden_size),
+                         BlockScaledProjection("attention.out", self.hidden_size, query)))
+        intermediate = (self.shared_expert_intermediate_size if self.num_experts is not None
+                        else self.intermediate_size)
+        if intermediate is not None:
+            rows.extend((BlockScaledProjection("mlp.gate_up", 2 * intermediate, self.hidden_size, 2, True),
+                         BlockScaledProjection("mlp.down", self.hidden_size, intermediate)))
+        return tuple(rows)
+
     def retained_prefix_demand(self, *, capacity: int, verification_width: int,
                                input_dtype: str = "bf16"):
         """Declare verification/commit semantics independently of kernel inventory.
