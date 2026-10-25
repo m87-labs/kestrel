@@ -6,12 +6,24 @@ import torch
 
 from kestrel.models.qwen35.cache import Qwen35InferenceCache
 from kestrel.models.qwen35.spec_decoder import Qwen35DFlashDecoder
-from test_prefix_finalize_commit import _packed_prefixes, _paired_outputs
+from tests.qwen35.test_prefix_finalize_commit import _packed_prefixes, _paired_outputs
+from kestrel.models.qwen35.prefix_output_bank import PrefixOutputBank
+
+
+def _prepare_output_bank(caches):
+    indices=tuple(range(len(caches[0].layers)))
+    templates=tuple(torch.cat([cache.layers[i].recurrent_states for cache in caches]) for i in indices)
+    bank=PrefixOutputBank(caches,indices,templates)
+    with bank.lease(()):
+        for output,initial in zip(bank.states,templates):output.copy_(initial)
+        bank.publish(caches)
+    return bank
 
 
 def test_inactive_banks_reuse_tensors_without_mutating_committed_sources(monkeypatch):
     sources, branches, _ = _packed_prefixes(count=2, layers=2)
     banks = tuple(source.fork_recurrent_state() for source in sources)
+    _prepare_output_bank(banks)
     pointers = tuple(layer.recurrent_states.data_ptr() for bank in banks for layer in bank.layers)
     records = branches[0]._prefix_records
     lengths = torch.tensor([3, 9], dtype=torch.int32)
@@ -19,8 +31,9 @@ def test_inactive_banks_reuse_tensors_without_mutating_committed_sources(monkeyp
         tuple(torch.full_like(record.initial_state, 42) for record in records.values()))
 
     @contextmanager
-    def finalize(*args):
-        yield outputs
+    def finalize(records, accepted, *, out_states):
+        for state in out_states:state.fill_(42)
+        yield _paired_outputs(records, accepted, out_states)
 
     def no_allocation(*args, **kwargs):
         raise AssertionError("commit allocated a destination")
@@ -45,6 +58,8 @@ def test_active_cache_cannot_be_used_as_staging_bank():
 def test_repeated_bank_swaps_keep_storage_bounded():
     current, _, _ = _packed_prefixes(count=2, layers=2)
     spare = tuple(source.fork_recurrent_state() for source in current)
+    _prepare_output_bank(current)
+    _prepare_output_bank(spare)
     owners = {id(cache) for cache in (*current, *spare)}
     pointers = {layer.recurrent_states.data_ptr() for cache in (*current, *spare) for layer in cache.layers}
     for value in range(3):
@@ -58,8 +73,9 @@ def test_repeated_bank_swaps_keep_storage_bounded():
             tuple(torch.full_like(record.initial_state, value) for record in records.values()))
 
         @contextmanager
-        def finalize(*args):
-            yield outputs
+        def finalize(records, accepted, *, out_states):
+            for state in out_states:state.fill_(value)
+            yield _paired_outputs(records, accepted, out_states)
 
         result = Qwen35InferenceCache.commit_recurrent_prefixes(
             branches, (2, 3), finalizer=finalize, _destinations=spare)
@@ -123,9 +139,10 @@ def test_partial_copy_failure_does_not_publish_inactive_bank(monkeypatch):
     exited = []
 
     @contextmanager
-    def finalize(*args):
+    def finalize(records, accepted, *, out_states):
         try:
-            yield outputs
+            for state in out_states:state.fill_(42)
+            yield _paired_outputs(records, accepted, out_states)
         finally:
             exited.append(True)
 

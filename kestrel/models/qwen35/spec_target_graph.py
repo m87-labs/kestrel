@@ -203,9 +203,9 @@ class Qwen35TargetGraph:
         if entry is None:
             if len(self._bound_outputs) >= self._runtime.max_batch_size:
                 _, (_, retired, _, _) = self._bound_outputs.popitem(last=False)
-                finalizer = self._finalizers.pop(id(retired), None)
-                if finalizer is not None:
-                    finalizer[1].shutdown()
+                for finalizer_key in tuple(self._finalizers):
+                    if finalizer_key[0] == id(retired):
+                        self._finalizers.pop(finalizer_key)[1].shutdown()
             remaining = iter(values[1 + len(self._capture_layers):])
             records, sources = {}, []
             for index, binding in zip(self._linear, self._prefix_bindings[shape], strict=True):
@@ -224,25 +224,113 @@ class Qwen35TargetGraph:
         self._bound_outputs.move_to_end(key)
         return entry
 
+    def prepare_output_bank(self, bank):
+        """Bound graph-retained payload before allocating a new destination bank.
+
+        Live cache views own their storage independently; this budget covers graph
+        retention only, not total device memory or allocator overhead.
+        """
+        if bank is None:
+            self._prepared_output_bank = None
+            return
+        geometry = bank.geometry
+        count = geometry.shapes[0][0]
+        if count > self._runtime.max_batch_size:
+            raise ValueError('prefix output cohort exceeds declared capacity')
+        signature = (tuple(shape[1:] for shape in geometry.shapes), geometry.dtypes,
+                     geometry.device)
+        previous = getattr(self, '_output_bank_signature', None)
+        if previous is not None and signature != previous:
+            raise ValueError('prefix output geometry changed within target owner')
+        self._output_bank_signature = signature
+        self._output_bank_budget = 2 * self._runtime.max_batch_size * (geometry.payload_bytes // count)
+        for key, entry in tuple(self._finalizers.items()):
+            owner = entry[2]
+            if owner is not None and not owner.is_current():
+                self._finalizers.pop(key)[1].shutdown()
+        def retained_bytes():
+            owners = {id(entry[2]): entry[2] for entry in self._finalizers.values()
+                      if entry[2] is not None}
+            owners[id(bank)] = bank
+            return sum(owner.geometry.payload_bytes for owner in owners.values())
+        while retained_bytes() > self._output_bank_budget:
+            _, entry = self._finalizers.popitem(last=False)
+            entry[1].shutdown()
+        self._prepared_output_bank = bank
+
+    def retire_output_banks(self, caches):
+        """Quiesce captured writers, then compact survivors outside the decode hot path.
+
+        All replacement allocations/copies complete before any cache publication.
+        External snapshots remain valid and may independently retain old storage.
+        """
+        caches = tuple(caches)
+        self._prepared_output_bank = None
+        owners = {id(owner): owner for cache in caches
+                  if (owner := getattr(cache, '_prefix_output_bank', None)) is not None}
+        for key, entry in tuple(self._finalizers.items()):
+            owner = entry[2]
+            if owner is not None and (id(owner) in owners or not owner.is_current()):
+                self._finalizers.pop(key)[1].shutdown()
+                owners[id(owner)] = owner
+        replacements = []
+        def clone_survivors():
+            for owner in owners.values():
+                for reference in owner.owners:
+                    cache = reference()
+                    if (cache is None or any(cache is retired for retired in caches)
+                            or getattr(cache, '_prefix_output_bank', None) is not owner):
+                        continue
+                    states = tuple(cache.layers[index].recurrent_states.clone(
+                        memory_format=torch.contiguous_format) for index in owner.indices)
+                    replacements.append((cache, owner.indices, states))
+        if owners and next(iter(owners.values())).geometry.device.type == 'cuda':
+            with torch.cuda.stream(self._finalize_stream):
+                clone_survivors()
+            self._finalize_stream.synchronize()
+        else:
+            clone_survivors()
+        for cache, indices, states in replacements:
+            for index, state in zip(indices, states):
+                cache.layers[index].recurrent_states = state
+            cache._prefix_output_bank = None
+        for owner in owners.values():
+            for reference in owner.owners:
+                cache = reference()
+                if cache is not None and getattr(cache, '_prefix_output_bank', None) is owner:
+                    cache._prefix_output_bank = None
+            owner.failed = True
+            owner.states, owner.row_states, owner.row_descriptors = None, (), ()
+        if getattr(self, '_prepared_output_bank', None) in owners.values():
+            self._prepared_output_bank = None
+
     @contextmanager
-    def finalize_prefixes(self, records, accepted_lengths):
+    def finalize_prefixes(self, records, accepted_lengths, *, out_states=None, output_owner=None):
         """Bind finalization to the producing entry, not merely its batch size."""
-        key = id(records)
+        out_states = None if out_states is None else tuple(out_states)
+        if output_owner is not None:
+            if out_states is None or len(out_states) != len(output_owner.states) or any(
+                    actual is not expected for actual, expected in zip(out_states, output_owner.states)):
+                raise ValueError('finalizer output tensors differ from prepared owner')
+            if getattr(self, '_prepared_output_bank', None) is not output_owner:
+                raise RuntimeError('output bank has no current allocation reservation')
+            self._prepared_output_bank = None
+        key = (id(records), None if out_states is None else tuple(id(t) for t in out_states))
         entry = self._finalizers.get(key)
         if entry is None:
-            if len(self._finalizers) >= self._runtime.max_batch_size:
+            if len(self._finalizers) >= 2 * self._runtime.max_batch_size:
                 _, oldest = self._finalizers.popitem(last=False)
                 oldest[1].shutdown()
             indices = tuple(sorted(records))
             contexts = tuple(records[index].prefix_context for index in indices)
             def forward(lengths):
-                return _finalize_recurrent_prefixes(records, lengths)
+                return _finalize_recurrent_prefixes(records, lengths, out_states=out_states)
 
             graph = FixedShapeSinglePassGraph(
                 enabled=all(context.supports_graph_capture for context in contexts),
                 device=self._runtime.device,
                 stream=self._finalize_stream, run_forward=forward, max_entries=1)
-            entry = (records, graph)
+            entry = (records, graph, output_owner)
             self._finalizers[key] = entry
         self._finalizers.move_to_end(key)
         with entry[1].launch(accepted_lengths) as outputs:
@@ -252,9 +340,10 @@ class Qwen35TargetGraph:
         try:
             self._graphs.shutdown()
         finally:
-            for _, graph in self._finalizers.values():
+            for _, graph, _ in self._finalizers.values():
                 graph.shutdown()
             self._finalizers.clear()
+            self._prepared_output_bank = None
             self._bound_outputs.clear()
             self._layouts.clear()
             self._prefix_bindings.clear()
