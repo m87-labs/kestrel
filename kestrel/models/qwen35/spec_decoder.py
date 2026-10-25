@@ -501,12 +501,15 @@ class Qwen35DFlashDecoder:
             begin, end = self._draft_timing_events
             begin.record()
         if warmed:
-            with self._pin_draft_owner(graph), graph.launch_tokens_many(
-                    [session.features for session in sessions], self.text.embed_tokens.weight,
-                    bonuses=[session.bonus for session in sessions],
-                    target_positions=[session.cache.seq_length for session in sessions]) as tokens:
-                if policy is not None:
-                    end.record()
+            with self._pin_draft_owner(graph):
+                with graph.launch_tokens_many(
+                        [session.features for session in sessions], self.text.embed_tokens.weight,
+                        bonuses=[session.bonus for session in sessions],
+                        target_positions=[session.cache.seq_length for session in sessions]) as tokens:
+                    if policy is not None:
+                        end.record()
+                # Queue context copies before the blocking host transfer. Keep
+                # the owner pinned and the output tensor live through the read.
                 ids = tokens.tolist()
         else:
             noise = torch.full((count, config.block_size), config.mask_token_id,
@@ -522,7 +525,8 @@ class Qwen35DFlashDecoder:
                     positions, [session.draft_cache for session in sessions], noise[:, 0]) as tokens:
                 if policy is not None:
                     end.record()
-                ids = tokens.tolist()
+            # The returned tensor owns its storage after the serialized lease.
+            ids = tokens.tolist()
         if policy is not None:
             confidence = self._batch_draft_confidence[count].flatten().tolist()
             if warmed:
