@@ -117,6 +117,10 @@ class DFlashDraftGraphSession:
                     if (tensor is None or tensor.shape != expected or tensor.device != parameter.device
                             or tensor.dtype != parameter.dtype):
                         raise ValueError("draft graph cache does not match model geometry")
+                    if not tensor.is_contiguous():
+                        raise ValueError("draft context copy requires contiguous cache storage; "
+                                         f"shape={tuple(tensor.shape)}, stride={tensor.stride()}; "
+                                         "PyTorch fallback is disabled")
         for index in range(len(model.layers)):
             workspace = DraftLayerKVWorkspace(
                 slots=len(self.caches), capacity=capacity, context_rows=self.context_rows,
@@ -140,7 +144,6 @@ class DFlashDraftGraphSession:
 
     def _bind_context_copy_plan(self):
         """Retain independent cache destinations while this owner cohort lives."""
-        self._context_copy_fallback_reason = None
         from kestrel_kernels.draft_context_copy import DraftContextCopyPlan
         sources, destinations = [], []
         for index, workspace in enumerate(self.workspaces):
@@ -150,8 +153,8 @@ class DFlashDraftGraphSession:
                 tuple(cache.layers[index].values for cache in self.caches)))
         tensors = (*sources, *(value for row in destinations for value in row))
         if any(not value.is_contiguous() for value in tensors):
-            self._context_copy_fallback_reason = "noncontiguous_cache_layout"
-            return None
+            raise ValueError("draft context copy requires contiguous cache storage; "
+                             "PyTorch fallback is disabled")
         ranges = sorted((value.data_ptr(), value.data_ptr() + value.numel() * value.element_size())
                         for value in tensors)
         if any(end > following for (_, end), (following, _) in zip(ranges, ranges[1:])):
@@ -167,8 +170,8 @@ class DFlashDraftGraphSession:
         return {
             "owners": len(self.caches),
             "context_copy": {
-                "implementation": "packed" if copy_plan is not None else "foreach",
-                "fallback_reason": self._context_copy_fallback_reason,
+                "implementation": "packed" if copy_plan is not None else "unbound",
+                "fallback_reason": None,
                 "launch_plan": asdict(copy_plan.launch_plan) if copy_plan is not None else None,
             },
             "staging_implementation": self._staging_implementation,
@@ -193,6 +196,10 @@ class DFlashDraftGraphSession:
                     if (tensor is None or tensor.shape != expected or tensor.device != workspace.keys.device
                             or tensor.dtype != workspace.keys.dtype):
                         raise ValueError("draft graph rebind cache geometry mismatch")
+                    if not tensor.is_contiguous():
+                        raise ValueError("draft context copy requires contiguous cache storage; "
+                                         f"shape={tuple(tensor.shape)}, stride={tensor.stride()}; "
+                                         "PyTorch fallback is disabled")
         self.stream.wait_stream(torch.cuda.current_stream(self.stream.device))
         with torch.cuda.stream(self.stream):
             for index, workspace in enumerate(self.workspaces):
@@ -314,21 +321,10 @@ class DFlashDraftGraphSession:
             self.active = False
 
     def _commit_context(self, lengths):
-        if self._context_copy_plan is not None:
-            self._context_copy_plan.run(self.lengths, lengths)
-        else:
-            destinations, sources = [], []
-            for index, workspace in enumerate(self.workspaces):
-                for slot, (cache, start, length) in enumerate(zip(self.caches, self.lengths, lengths)):
-                    if length:
-                        destinations.extend((cache.layers[index].keys[0, start:start + length],
-                                             cache.layers[index].values[0, start:start + length]))
-                        sources.extend((workspace.keys[slot, start:start + length],
-                                        workspace.values[slot, start:start + length]))
-                        cache.layers[index].keys.record_stream(self.stream)
-                        cache.layers[index].values.record_stream(self.stream)
-            if destinations:
-                torch._foreach_copy_(destinations, sources)
+        if self._context_copy_plan is None:
+            raise RuntimeError("draft context copy requires a bound native copy plan; "
+                               "PyTorch fallback is disabled")
+        self._context_copy_plan.run(self.lengths, lengths)
         self.lengths = tuple(start + length for start, length in zip(self.lengths, lengths))
         for cache, length in zip(self.caches, self.lengths):
             cache.length = length
