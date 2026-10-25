@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from .qwen_model import _RecurrentPrefixRecord
 
 
-def _finalize_recurrent_prefixes(records, accepted_lengths):
+def _finalize_recurrent_prefixes(records, accepted_lengths, *, out_states=None):
     """Return layer/row-ordered leased state/history pairs without changing owners."""
     from kestrel_kernels import get_runtime
 
@@ -34,7 +34,8 @@ def _finalize_recurrent_prefixes(records, accepted_lengths):
                 or initial.shape[0] != count
                 or history.device != initial.device or history.dtype != initial.dtype):
             raise ValueError("packed prefix convolution history geometry changed")
-    states = tuple(torch.empty_like(record.initial_state) for record in ordered)
+    states = (tuple(torch.empty_like(record.initial_state) for record in ordered)
+              if out_states is None else tuple(out_states))
     get_runtime().gated_delta.finalize_packed_gated_delta_prefix(
         tuple(record.prefix_context for record in ordered), accepted_lengths,
         out_states=states)
@@ -153,6 +154,7 @@ class Qwen35InferenceCache:
         """
         branch = copy(self)
         branch._borrowed_recurrent_state = False
+        branch._prefix_output_bank = None
         if capture_prefix and (self._prefix_source is not None or self.seq_length <= 0):
             raise ValueError("prefix capture requires a committed nonempty cache")
         branch._prefix_source = self if capture_prefix else None
@@ -226,7 +228,8 @@ class Qwen35InferenceCache:
         return packed, branches
 
     @staticmethod
-    def commit_recurrent_prefixes(caches, lengths, *, finalizer=None, _destinations=None):
+    def commit_recurrent_prefixes(caches, lengths, *, finalizer=None, _destinations=None,
+                                  _prepare_output_bank=None):
         """Finalize one packed verification before publishing any cache state."""
         from contextlib import nullcontext
 
@@ -281,45 +284,72 @@ class Qwen35InferenceCache:
                     raise ValueError("packed prefix state geometry changed")
         templates = tuple(records[index].initial_state for index in indices)
         accepted = torch.tensor(lengths, device=templates[0].device, dtype=torch.int32)
-        if finalizer is None:
-            lease = nullcontext(_finalize_recurrent_prefixes(records, accepted))
-        else:
-            lease = finalizer(records, accepted)
-        with lease as outputs:
-            if len(outputs) != 2 * len(indices) * count:
-                raise ValueError("packed prefix finalizer requires state/history pairs")
-            # Allocate after submission to overlap host work with finalization.
-            # Destinations remain detached until every state/history is written.
-            results = [] if _destinations is None else list(_destinations)
-            for source in (() if _destinations is not None else sources):
-                result = copy(source)
-                result._prefix_source = None
-                result._prefix_start = result._prefix_row = 0
-                result._prefix_records = {}
-                layers = list(source.layers)
-                # Both fields are fully overwritten before publication.
+        bank = None
+        if _destinations is not None:
+            from .prefix_output_bank import PrefixOutputBank
+            bank = getattr(_destinations[0], '_prefix_output_bank', None)
+            if bank is None or not bank.matches(_destinations, indices, templates):
+                bank = PrefixOutputBank(_destinations, indices, templates,
+                                        allocate=_prepare_output_bank is None)
+            if _prepare_output_bank is not None:
+                try:
+                    _prepare_output_bank(bank)
+                    bank.materialize()
+                except BaseException:
+                    _prepare_output_bank(None)
+                    raise
+        source_tensors = tuple(getattr(source.layers[index], name)
+                               for source in sources for index in indices
+                               for name in ('recurrent_states', 'conv_states'))
+        with (nullcontext(None) if bank is None else bank.lease(source_tensors)) as out_states:
+            kwargs = {} if out_states is None else {'out_states': out_states}
+            if bank is not None and _prepare_output_bank is not None:
+                if finalizer is None:
+                    raise ValueError('prepared output bank requires an owned finalizer')
+                kwargs['output_owner'] = bank
+            lease = (nullcontext(_finalize_recurrent_prefixes(records, accepted, **kwargs))
+                     if finalizer is None else finalizer(records, accepted, **kwargs))
+            with lease as outputs:
+                if len(outputs) != 2 * len(indices) * count:
+                    raise ValueError("packed prefix finalizer requires state/history pairs")
+                # Allocate after submission to overlap host work with finalization.
+                # Destinations remain detached until every state/history is written.
+                results = [] if _destinations is None else list(_destinations)
+                for source in (() if _destinations is not None else sources):
+                    result = copy(source)
+                    result._prefix_source = None
+                    result._prefix_output_bank = None
+                    result._prefix_start = result._prefix_row = 0
+                    result._prefix_records = {}
+                    layers = list(source.layers)
+                    # Both fields are fully overwritten before publication.
+                    for index in indices:
+                        layer = copy(layers[index])
+                        layer.conv_states = torch.empty_like(layer.conv_states)
+                        layer.recurrent_states = torch.empty_like(layer.recurrent_states)
+                        layers[index] = layer
+                    result.layers = tuple(layers)
+                    results.append(result)
+                results = tuple(results)
+                state_destinations, states = [], []
+                conv_destinations, histories = [], []
+                values = iter(outputs)
                 for index in indices:
-                    layer = copy(layers[index])
-                    layer.conv_states = torch.empty_like(layer.conv_states)
-                    layer.recurrent_states = torch.empty_like(layer.recurrent_states)
-                    layers[index] = layer
-                result.layers = tuple(layers)
-                results.append(result)
-            results = tuple(results)
-            state_destinations, states = [], []
-            conv_destinations, histories = [], []
-            values = iter(outputs)
-            for index in indices:
-                for result in results:
-                    state, history = next(values), next(values)
-                    layer = result.layers[index]
-                    state_destinations.append(layer.recurrent_states)
-                    states.append(state)
-                    conv_destinations.append(layer.conv_states)
-                    histories.append(history)
-                    layer.has_previous_state = True
-            torch._foreach_copy_(state_destinations, states)
-            torch._foreach_copy_(conv_destinations, histories)
+                    for result in results:
+                        state, history = next(values), next(values)
+                        layer = result.layers[index]
+                        state_destinations.append(layer.recurrent_states)
+                        states.append(state)
+                        conv_destinations.append(layer.conv_states)
+                        histories.append(history)
+                        layer.has_previous_state = True
+                if bank is not None:
+                    bank.validate_returned_states(states)
+                if bank is None:
+                    torch._foreach_copy_(state_destinations, states)
+                torch._foreach_copy_(conv_destinations, histories)
+                if bank is not None:
+                    bank.publish(results)
         for cache, result, length in zip(caches, results, lengths):
             result.advance_to(cache._prefix_start + length)
             cache._prefix_records = {}

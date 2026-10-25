@@ -717,7 +717,9 @@ class Qwen35DFlashDecoder:
                         [ctx[1] for ctx in pending], [ctx[4] for ctx in pending],
                         finalizer=(None if self._target_graph is None
                                    else self._target_graph.finalize_prefixes),
-                        _destinations=[session.spare_cache for session, _ in sessions])
+                        _destinations=[session.spare_cache for session, _ in sessions],
+                        _prepare_output_bank=(None if self._target_graph is None
+                                              else self._target_graph.prepare_output_bank))
                 for (session, _, features, expected, count), cache in zip(pending, committed):
                     session.spare_cache = session.cache
                     session.cache = cache
@@ -768,6 +770,8 @@ class Qwen35DFlashDecoder:
             raise ValueError("cannot retire a different speculative sequence")
         if self._commit_pending:
             self._commit_ready.synchronize()
+        if self._target_graph is not None:
+            self._target_graph.retire_output_banks((session.cache, session.spare_cache))
         self._draft_owners.detach_cache_owner(session.draft_cache)
         self.runtime.page_table.erase(state.batch_idx)
         # Scheduler cleanup still uses batch_idx to remove active_sequences.
